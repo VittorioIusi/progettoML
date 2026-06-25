@@ -584,6 +584,335 @@ def evaluate_lora_vs_baseline(
     return df, history
 
 
+def train_lora_multi(
+    clf: Any,
+    train_datasets: List[Tuple[np.ndarray, np.ndarray]],
+    *,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 0.0,
+    device: str = "cuda",
+    n_ctx_plus_query: int = 10_000,
+    query_ratio: float = 0.2,
+    grad_clip: float | None = 1.0,
+    random_state: int = 42,
+    early_stopping: bool = True,
+    es_val_ratio: float = 0.2,
+    patience: int = 10,
+    eval_every: int = 2,
+    n_estimators_eval: int = 2,
+    verbose: bool = True,
+) -> List[float]:
+    """Allena i soli adapter LoRA su PIU' dataset congiuntamente.
+
+    Ad ogni epoca il modello vede un batch per ciascun dataset (un passo di
+    ottimizzazione per dataset), cosi' gli adapter imparano qualcosa di comune
+    ai dataset. L'early stopping usa la media dell'AUC sui validation interni
+    (una porzione tenuta da parte per ogni dataset).
+
+    Args:
+        clf: Il ``TabPFNClassifier`` con LoRA iniettato.
+        train_datasets: Lista di coppie ``(X, y)``, una per dataset.
+        (gli altri argomenti sono come in :func:`train_lora`.)
+
+    Returns:
+        Lista delle loss medie di training per epoca (media sui batch/dataset).
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    from tabpfn import TabPFNClassifier
+    from tabpfn.architectures.interface import PerformanceOptions
+    from tabpfn.finetuning.data_util import (
+        get_preprocessed_dataset_chunks,
+        meta_dataset_collator,
+    )
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
+
+    net = clf.model_
+    net.to(device)
+
+    trainable_params = [p for p in net.parameters() if p.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("Nessun parametro allenabile (LoRA iniettato?).")
+    optimizer = torch.optim.AdamW(
+        trainable_params, lr=learning_rate, weight_decay=weight_decay
+    )
+    perf = PerformanceOptions(
+        force_recompute_layer=False, use_chunkwise_inference=False
+    )
+
+    # Split train/early-stopping per ciascun dataset.
+    train_parts: List[Tuple[np.ndarray, np.ndarray]] = []
+    es_parts: List[Tuple[np.ndarray, np.ndarray]] = []
+    for X, y in train_datasets:
+        if early_stopping:
+            X_tr, X_es, y_tr, y_es = train_test_split(
+                X, y, test_size=es_val_ratio, random_state=random_state, stratify=y
+            )
+            train_parts.append((X_tr, y_tr))
+            es_parts.append((X_es, y_es))
+        else:
+            train_parts.append((X, y))
+
+    X_list = [p[0] for p in train_parts]
+    y_list = [p[1] for p in train_parts]
+
+    def _mean_val_auc() -> float:
+        eval_args = {
+            "device": device,
+            "n_estimators": n_estimators_eval,
+            "random_state": random_state,
+        }
+        aucs = []
+        for (X_tr, y_tr), (X_es, y_es) in zip(train_parts, es_parts):
+            ev = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+            ev.fit(X_tr, y_tr)
+            proba = ev.predict_proba(X_es)[:, 1]
+            aucs.append(roc_auc_score(y_es, proba))
+        return float(np.mean(aucs))
+
+    history: List[float] = []
+    best_auc = -float("inf")
+    best_state: dict | None = None
+    epochs_no_improve = 0
+
+    for epoch in range(epochs):
+        seed = random_state + epoch
+        net.train()
+
+        # Un batch per dataset: split contesto/query per frazione.
+        splitter = partial(train_test_split, test_size=query_ratio, random_state=seed)
+        datasets = get_preprocessed_dataset_chunks(
+            calling_instance=clf,
+            X_raw=X_list,
+            y_raw=y_list,
+            split_fn=splitter,
+            max_data_size=n_ctx_plus_query,
+            model_type="classifier",
+            equal_split_size=False,
+            data_shuffle_seed=seed,
+            preprocessing_random_state=seed,
+        )
+        loader = torch.utils.data.DataLoader(
+            datasets,
+            batch_size=1,
+            collate_fn=meta_dataset_collator,
+            shuffle=True,
+            generator=torch.Generator().manual_seed(seed),
+        )
+
+        epoch_loss, n_batches = 0.0, 0
+        for batch in loader:
+            if _should_skip_batch(batch):
+                continue
+            optimizer.zero_grad()
+            clf.fit_from_preprocessed(
+                batch.X_context,
+                batch.y_context,
+                batch.cat_indices,
+                batch.configs,
+                performance_options=perf,
+            )
+            logits_QBEL = clf.forward(batch.X_query, return_raw_logits=True)
+            Q, B, E, L = logits_QBEL.shape
+            logits_BLQ = logits_QBEL.permute(1, 2, 3, 0).reshape(B * E, L, Q)
+            targets_BQ = batch.y_query.repeat(B * E, 1).to(device)
+            loss = F.cross_entropy(logits_BLQ, targets_BQ)
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+            optimizer.step()
+            epoch_loss += float(loss.detach().item())
+            n_batches += 1
+
+        mean_loss = epoch_loss / n_batches if n_batches > 0 else float("nan")
+        history.append(mean_loss)
+        msg = f"Epoch {epoch + 1}/{epochs} - loss: {mean_loss:.4f} ({n_batches} batch)"
+
+        if early_stopping and (epoch + 1) % eval_every == 0:
+            net.eval()
+            with torch.no_grad():
+                val_auc = _mean_val_auc()
+            msg += f" | media val AUC: {val_auc:.4f}"
+            if val_auc > best_auc + 1e-4:
+                best_auc = val_auc
+                best_state = lora_state_dict(net)
+                epochs_no_improve = 0
+                msg += " *"
+            else:
+                epochs_no_improve += 1
+
+        if verbose:
+            print(msg)
+
+        if early_stopping and epochs_no_improve >= patience:
+            if verbose:
+                print(f"Early stopping all'epoca {epoch + 1} (best AUC: {best_auc:.4f})")
+            break
+
+    if early_stopping and best_state is not None:
+        net.load_state_dict(best_state, strict=False)
+        if verbose:
+            print(f"Ripristinati i pesi LoRA migliori (media val AUC: {best_auc:.4f})")
+
+    return history
+
+
+def run_lora_exp5(
+    *,
+    finetune_names: List[str] | None = None,
+    eval_names: List[str] | None = None,
+    lora_config: LoRAConfig | None = None,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
+    device: str = "cuda",
+    n_estimators_train: int = 2,
+    n_estimators_eval: int = 8,
+    random_state: int = 42,
+    save_path: str | None = None,
+    verbose: bool = True,
+) -> Tuple[Any, List[float]]:
+    """Esperimento 5: LoRA addestrato sui dataset medici, valutato su quelli di test.
+
+    Allena UN solo LoRA congiuntamente sui dataset di fine-tuning (medici) e poi
+    confronta TabPFN base vs TabPFN+LoRA sui dataset di valutazione (mai visti in
+    training), misurando cosi' la **generalizzazione** dell'adattamento LoRA.
+
+    Args:
+        finetune_names: Nomi dei dataset di training (default: tutti i
+            ``FINETUNE_DATASETS``).
+        eval_names: Nomi dei dataset di valutazione (default: tutti gli
+            ``EVALUATION_DATASETS``).
+        lora_config: Configurazione LoRA.
+        epochs: Epoche di training.
+        learning_rate: Learning rate degli adapter.
+        device: Device di calcolo.
+        n_estimators_train: Estimatori usati in training/early-stopping.
+        n_estimators_eval: Estimatori usati nella valutazione finale.
+        random_state: Seed.
+        save_path: Se fornito, salva i pesi LoRA in questo file ``.pt``.
+        verbose: Se True, stampa avanzamento e tabella finale.
+
+    Returns:
+        Tupla ``(df, history)`` con il DataFrame di confronto (due righe per
+        dataset di valutazione: base e LoRA) e la curva di loss del training.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
+
+    try:
+        from utils.data_loader import (
+            EVALUATION_DATASETS,
+            FINETUNE_DATASETS,
+            get_evaluation_data,
+            get_finetune_data,
+        )
+        from evaluation.metrics import (
+            evaluate_model,
+            evaluate_multiple_datasets,
+            print_comparison_table,
+        )
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Assicurati che la root del progetto sia nel sys.path "
+            "(es. sys.path.insert(0, '/content/progettoML'))."
+        ) from exc
+
+    if finetune_names is None:
+        finetune_names = list(FINETUNE_DATASETS)
+    if eval_names is None:
+        eval_names = list(EVALUATION_DATASETS)
+    if lora_config is None:
+        lora_config = LoRAConfig()
+
+    # --- 1. Carica i dataset medici di training --------------------------
+    if verbose:
+        print(f"Carico {len(finetune_names)} dataset di fine-tuning: {finetune_names}")
+    train_datasets = []
+    for name in finetune_names:
+        X_tr, y_tr, _, _ = get_finetune_data(name, random_state=random_state)
+        train_datasets.append((X_tr, y_tr))
+
+    # --- 2. Crea e allena il LoRA congiunto ------------------------------
+    clf, injected = create_lora_classifier(
+        lora_config,
+        device=device,
+        n_estimators=n_estimators_train,
+        random_state=random_state,
+    )
+    if verbose:
+        tr, tot, pct = count_trainable_parameters(clf.model_)
+        print(f"adapter={len(injected)} | allenabili={tr:,}/{tot:,} ({pct:.3f}%)")
+        print(f"Alleno UN LoRA su {len(train_datasets)} dataset medici insieme...\n")
+
+    history = train_lora_multi(
+        clf,
+        train_datasets,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        device=device,
+        random_state=random_state,
+        n_estimators_eval=n_estimators_train,
+        verbose=verbose,
+    )
+
+    if save_path is not None:
+        save_lora_adapters(clf.model_, save_path)
+        if verbose:
+            print(f"\nPesi LoRA salvati in '{save_path}'")
+
+    # --- 3. Confronto base vs LoRA sui dataset di valutazione ------------
+    results = []
+    eval_args = {
+        "device": device,
+        "n_estimators": n_estimators_eval,
+        "random_state": random_state,
+    }
+    for name in eval_names:
+        if verbose:
+            print(f"\nValuto base vs LoRA su '{name}' (mai visto in training)...")
+        X_tr, y_tr, X_te, y_te = get_evaluation_data(name, random_state=random_state)
+
+        # Baseline
+        base = TabPFNClassifier.create_default_for_version(
+            version=ModelVersion.V2_5,
+            device=device,
+            n_estimators=n_estimators_eval,
+            random_state=random_state,
+        )
+        base.fit(X_tr, y_tr)
+        prob_base = base.predict_proba(X_te)[:, 1]
+        results.append(evaluate_model(y_te, prob_base, "TabPFN-base", name))
+        del base
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # LoRA (stessi adapter, dataset di test come contesto)
+        lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+        lora_infer.fit(X_tr, y_tr)
+        prob_lora = lora_infer.predict_proba(X_te)[:, 1]
+        results.append(evaluate_model(y_te, prob_lora, "TabPFN-LoRA", name))
+        del lora_infer
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    df = evaluate_multiple_datasets(results)
+    if verbose:
+        print_comparison_table(df)
+
+    return df, history
+
+
 if __name__ == "__main__":
     # Questo modulo richiede tabpfn + GPU e va eseguito su Colab.
     # In locale serve solo a verificare che la sintassi sia corretta.
