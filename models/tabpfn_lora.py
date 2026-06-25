@@ -43,6 +43,7 @@ try:
         LoRAConfig,
         count_trainable_parameters,
         inject_lora_adapters,
+        lora_state_dict,
         mark_only_lora_as_trainable,
         save_lora_adapters,
     )
@@ -51,6 +52,7 @@ except ImportError:  # pragma: no cover - fallback per esecuzione come script
         LoRAConfig,
         count_trainable_parameters,
         inject_lora_adapters,
+        lora_state_dict,
         mark_only_lora_as_trainable,
         save_lora_adapters,
     )
