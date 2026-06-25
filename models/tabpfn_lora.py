@@ -137,30 +137,40 @@ def train_lora(
     X_train: np.ndarray,
     y_train: np.ndarray,
     *,
-    epochs: int = 10,
-    learning_rate: float = 1e-3,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
     weight_decay: float = 0.0,
     device: str = "cuda",
     n_ctx_plus_query: int = 10_000,
     query_ratio: float = 0.2,
     grad_clip: float | None = 1.0,
     random_state: int = 42,
+    early_stopping: bool = True,
+    es_val_ratio: float = 0.2,
+    patience: int = 10,
+    eval_every: int = 1,
+    n_estimators_eval: int = 2,
     verbose: bool = True,
 ) -> List[float]:
-    """Allena i soli adapter LoRA di ``clf`` sui dati forniti.
+    """Allena i soli adapter LoRA di ``clf``, con early stopping su validation.
 
     Per ogni epoca i dati vengono ri-mescolati, preprocessati con le primitive
     di TabPFN e suddivisi in batch contesto/query; per ogni batch si calcola la
     cross-entropy sulle query e si aggiornano unicamente i parametri LoRA.
+
+    Se ``early_stopping`` e' True, una porzione di ``X_train`` viene tenuta da
+    parte (split interno) e usata per valutare l'AUC ad ogni epoca: si tengono i
+    pesi LoRA con AUC migliore e si interrompe dopo ``patience`` epoche senza
+    miglioramento. Questo split interno e' **separato** dall'eventuale validation
+    set usato dal chiamante per il confronto finale (niente data leakage).
 
     Args:
         clf: Il ``TabPFNClassifier`` con LoRA iniettato (output di
             :func:`create_lora_classifier`).
         X_train: Feature di training, shape ``(n_samples, n_features)``.
         y_train: Label di training (0/1), shape ``(n_samples,)``.
-        epochs: Numero di epoche.
-        learning_rate: Learning rate dell'ottimizzatore AdamW. Per il LoRA si
-            usano valori piu' alti che per il full fine-tuning (default ``1e-3``).
+        epochs: Numero massimo di epoche.
+        learning_rate: Learning rate di AdamW (default ``1e-4`` per stabilita').
         weight_decay: Weight decay di AdamW.
         device: Device di calcolo.
         n_ctx_plus_query: Numero massimo di campioni per meta-dataset
@@ -169,22 +179,32 @@ def train_lora(
         grad_clip: Norma massima per il gradient clipping (``None`` per
             disabilitarlo).
         random_state: Seed base (per epoca si usa ``random_state + epoch``).
-        verbose: Se True, stampa la loss media a fine epoca.
+        early_stopping: Se True, abilita la validazione per-epoca e l'early
+            stopping con ripristino dei pesi migliori.
+        es_val_ratio: Frazione di ``X_train`` riservata alla validazione interna
+            di early stopping.
+        patience: Numero di epoche senza miglioramento prima di fermarsi.
+        eval_every: Ogni quante epoche valutare l'AUC di validazione.
+        n_estimators_eval: Numero di estimatori usati nella valutazione di
+            early stopping (basso = piu' veloce).
+        verbose: Se True, stampa loss e AUC per epoca.
 
     Returns:
-        Lista delle loss medie per epoca (utile per tracciare la curva).
+        Lista delle loss medie di training per epoca.
     """
+    from sklearn.metrics import roc_auc_score
     from sklearn.model_selection import train_test_split
 
+    from tabpfn import TabPFNClassifier
     from tabpfn.architectures.interface import PerformanceOptions
     from tabpfn.finetuning.data_util import (
         get_preprocessed_dataset_chunks,
         meta_dataset_collator,
     )
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
 
     net = clf.model_
     net.to(device)
-    net.train()
 
     # Ottimizzatore sui SOLI parametri allenabili (gli adapter LoRA).
     trainable_params = [p for p in net.parameters() if p.requires_grad]
@@ -204,14 +224,44 @@ def train_lora(
         use_chunkwise_inference=False,
     )
 
-    n_classes = int(len(np.unique(y_train)))
-    max_data = min(n_ctx_plus_query, len(y_train))
+    # Split interno per l'early stopping (tiene pulito il validation del
+    # chiamante). Il training avviene su X_tr; l'AUC si misura su X_es.
+    if early_stopping:
+        X_tr, X_es, y_tr, y_es = train_test_split(
+            X_train,
+            y_train,
+            test_size=es_val_ratio,
+            random_state=random_state,
+            stratify=y_train,
+        )
+    else:
+        X_tr, y_tr = X_train, y_train
+        X_es, y_es = None, None
+
+    n_classes = int(len(np.unique(y_tr)))
+    max_data = min(n_ctx_plus_query, len(y_tr))
     query_size = max(int(max_data * query_ratio), n_classes)
 
+    def _validation_auc() -> float:
+        """AUC del modello LoRA corrente: clona, fitta su X_tr, predice X_es."""
+        eval_args = {
+            "device": device,
+            "n_estimators": n_estimators_eval,
+            "random_state": random_state,
+        }
+        ev = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+        ev.fit(X_tr, y_tr)
+        proba = ev.predict_proba(X_es)[:, 1]
+        return float(roc_auc_score(y_es, proba))
+
     history: List[float] = []
+    best_auc = -float("inf")
+    best_state: dict | None = None
+    epochs_no_improve = 0
 
     for epoch in range(epochs):
         seed = random_state + epoch
+        net.train()
 
         # Split contesto/query rigenerato ogni epoca con seed diverso.
         splitter = partial(
@@ -219,8 +269,8 @@ def train_lora(
         )
         datasets = get_preprocessed_dataset_chunks(
             calling_instance=clf,
-            X_raw=X_train,
-            y_raw=y_train,
+            X_raw=X_tr,
+            y_raw=y_tr,
             split_fn=splitter,
             max_data_size=max_data,
             model_type="classifier",
@@ -272,11 +322,38 @@ def train_lora(
 
         mean_loss = epoch_loss / n_batches if n_batches > 0 else float("nan")
         history.append(mean_loss)
+        msg = f"Epoch {epoch + 1}/{epochs} - loss: {mean_loss:.4f}"
+
+        # --- Early stopping su validation interno ---
+        if early_stopping and (epoch + 1) % eval_every == 0:
+            net.eval()
+            with torch.no_grad():
+                val_auc = _validation_auc()
+            msg += f" | val AUC: {val_auc:.4f}"
+            if val_auc > best_auc + 1e-4:
+                best_auc = val_auc
+                best_state = lora_state_dict(net)  # copia CPU dei soli pesi LoRA
+                epochs_no_improve = 0
+                msg += " *"
+            else:
+                epochs_no_improve += 1
+
         if verbose:
-            print(
-                f"Epoch {epoch + 1}/{epochs} - loss media: {mean_loss:.4f} "
-                f"({n_batches} batch)"
-            )
+            print(msg)
+
+        if early_stopping and epochs_no_improve >= patience:
+            if verbose:
+                print(
+                    f"Early stopping all'epoca {epoch + 1} "
+                    f"(miglior val AUC: {best_auc:.4f})"
+                )
+            break
+
+    # Ripristina i pesi LoRA migliori visti durante il training.
+    if early_stopping and best_state is not None:
+        net.load_state_dict(best_state, strict=False)
+        if verbose:
+            print(f"Ripristinati i pesi LoRA migliori (val AUC: {best_auc:.4f})")
 
     return history
 
@@ -289,8 +366,8 @@ def finetune_lora_on_dataset(
     dataset_name: str,
     *,
     lora_config: LoRAConfig | None = None,
-    epochs: int = 10,
-    learning_rate: float = 1e-3,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
     device: str = "cuda",
     n_estimators: int = 2,
     random_state: int = 42,
@@ -372,8 +449,8 @@ def evaluate_lora_vs_baseline(
     dataset_name: str,
     *,
     lora_config: LoRAConfig | None = None,
-    epochs: int = 30,
-    learning_rate: float = 1e-3,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
     device: str = "cuda",
     n_estimators_train: int = 2,
     n_estimators_eval: int = 8,
@@ -475,6 +552,7 @@ def evaluate_lora_vs_baseline(
         learning_rate=learning_rate,
         device=device,
         random_state=random_state,
+        n_estimators_eval=n_estimators_train,
         verbose=verbose,
     )
 
