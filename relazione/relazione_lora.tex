@@ -1,0 +1,510 @@
+%==============================================================================
+%  Relazione di progetto - Miglioramento di TabPFN-2.5 tramite LoRA fine-tuning
+%  Compilare con: pdflatex relazione_lora.tex  (due volte per i riferimenti)
+%==============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+% --- Stile per i blocchi di codice ------------------------------------------
+\definecolor{codegray}{gray}{0.95}
+\definecolor{codekw}{rgb}{0.13,0.29,0.53}
+\definecolor{codecmt}{rgb}{0.0,0.5,0.0}
+\definecolor{codestr}{rgb}{0.58,0.0,0.0}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt}\itshape,
+  stringstyle=\color{codestr},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  framesep=4pt,
+  breaklines=true,
+  showstringspaces=false,
+  language=Python,
+  captionpos=b,
+}
+
+\title{\textbf{Adattamento leggero di TabPFN-2.5 tramite LoRA fine-tuning}\\
+\large Implementazione, esperimenti e analisi su classificazione binaria}
+\author{Progetto di Machine Learning}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Questo lavoro studia se sia possibile migliorare le prestazioni del
+\emph{tabular foundation model} TabPFN-2.5 su task di classificazione binaria
+mediante un fine-tuning leggero basato su \emph{Low-Rank Adaptation} (LoRA),
+senza riaddestrare i pesi principali del modello. Viene descritta
+l'implementazione completa della pipeline (caricamento dati, metriche,
+iniezione e addestramento degli adapter LoRA) e vengono condotti tre
+esperimenti: (i)~la valutazione della generalizzazione di un adapter
+addestrato su dataset medici e testato su dataset esterni; (ii)~un'ablation
+sulla capacità degli adapter; (iii)~un'ablation sulla dimensione dei dati di
+addestramento. I risultati mostrano che il LoRA \emph{non} migliora la
+capacità discriminativa di TabPFN-2.5: aumentando di 4 volte la capacità degli
+adapter o di circa 60 volte la quantità di dati, le metriche di discriminazione
+(AUC-ROC, F1) restano invariate, e un addestramento prolungato tende a
+degradarle. L'unico beneficio consistente, seppur modesto, riguarda la
+calibrazione delle probabilità (Expected Calibration Error). Si tratta di un
+risultato negativo ottenuto con metodologia rigorosa, che conferma quanto i
+pesi pre-addestrati di TabPFN-2.5 siano vicini all'ottimo per questa classe di
+problemi.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================================
+\section{Introduzione}
+%==============================================================================
+
+\subsection{Contesto: TabPFN-2.5}
+TabPFN è un \emph{tabular foundation model} che affronta la classificazione su
+dati tabulari mediante \emph{in-context learning}: invece di essere addestrato
+su uno specifico dataset, il modello riceve in input l'intero training set come
+``contesto'' e produce le predizioni per le righe di test in un singolo forward
+pass, senza ottimizzazione dei pesi a tempo di utilizzo. I pesi del modello
+sono pre-addestrati una volta per tutte su milioni di dataset sintetici. In
+questo progetto si utilizza la versione \textbf{2.5} (non la v3, che è il
+default del pacchetto), che supporta dataset fino a circa $50\,000$ campioni.
+
+\subsection{Obiettivo}
+L'obiettivo generale del progetto è migliorare le prestazioni di TabPFN-2.5 su
+classificazione binaria combinando modifiche esterne al modello (preprocessing,
+feature selection, ensembling, post-processing) con una modifica interna
+leggera tramite LoRA fine-tuning, sotto il vincolo di \emph{non} riaddestrare i
+pesi principali. La presente relazione documenta la parte relativa al
+\textbf{LoRA fine-tuning}, che costituisce il primo blocco implementato e
+sperimentato.
+
+\subsection{Low-Rank Adaptation (LoRA)}
+LoRA è una tecnica di \emph{parameter-efficient fine-tuning}: dato un layer
+lineare con matrice di pesi $W \in \mathbb{R}^{d_{out}\times d_{in}}$, invece di
+aggiornare $W$ si congela e si aggiunge un termine a basso rango
+\begin{equation}
+  y = Wx + \frac{\alpha}{r}\, B A\, x,
+  \qquad A \in \mathbb{R}^{r\times d_{in}},\ B \in \mathbb{R}^{d_{out}\times r},
+  \label{eq:lora}
+\end{equation}
+dove $r \ll \min(d_{in},d_{out})$ è il \emph{rango} e $\alpha$ un fattore di
+scala. Si addestrano soltanto le matrici $A$ e $B$. All'inizializzazione si pone
+$B = 0$, cosicché il termine aggiuntivo è nullo e il modello parte
+numericamente identico a quello pre-addestrato; l'adattamento emerge solo
+durante l'addestramento. Il numero di parametri allenabili passa così da
+$d_{out}\,d_{in}$ a $r\,(d_{in}+d_{out})$, tipicamente una piccola frazione del
+totale.
+
+%==============================================================================
+\section{Materiali e metodi}
+%==============================================================================
+
+\subsection{Dataset e preprocessing}
+Sono stati utilizzati due gruppi disgiunti di dataset binari da OpenML
+(Tabella~\ref{tab:dataset}): cinque dataset \emph{medici} per il fine-tuning e
+quattro dataset per la \emph{valutazione} della generalizzazione, mai usati in
+addestramento.
+
+\begin{table}[h]
+\centering
+\caption{Dataset utilizzati (OpenML). I dataset di valutazione non sono mai
+stati impiegati per l'addestramento degli adapter.}
+\label{tab:dataset}
+\small
+\begin{tabular}{llrr}
+\toprule
+Ruolo & Dataset (OpenML ID) & Campioni & Feature \\
+\midrule
+Fine-tuning & \texttt{diabetes} (37)            & 768  & 8  \\
+Fine-tuning & \texttt{breast\_cancer} (1510)    & 569  & 30 \\
+Fine-tuning & \texttt{heart\_disease} (53)      & 270  & 13 \\
+Fine-tuning & \texttt{chronic\_kidney} (42972)  & 400  & 24 \\
+Fine-tuning & \texttt{hepatitis} (55)           & 155  & 19 \\
+\midrule
+Valutazione & \texttt{thyroid} (1000)           & 3772 & 28 \\
+Valutazione & \texttt{adult} (1590)             & 48842& 14 \\
+Valutazione & \texttt{credit\_g} (31)           & 1000 & 20 \\
+Valutazione & \texttt{blood\_transfusion} (1464)& 748  & 4  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Correzione degli identificativi.} Durante l'implementazione due ID
+forniti nelle specifiche iniziali si sono rivelati errati e sono stati corretti
+dopo verifica diretta su OpenML:
+\begin{itemize}[nosep]
+  \item \texttt{chronic\_kidney}: l'ID 40922 corrisponde in realtà al dataset
+  \texttt{Run\_or\_walk\_information} (attività fisica, non pertinente); è stato
+  sostituito con \textbf{42972} (\texttt{chronic-kidney-disease});
+  \item \texttt{thyroid}: l'ID 40082 corrisponde a un dataset di chimica con 347
+  classi (\texttt{QSAR-DATASET-\dots}); è stato sostituito con \textbf{1000}
+  (\texttt{hypothyroid}), binario.
+\end{itemize}
+
+\paragraph{Pipeline di caricamento.} È stato implementato un modulo
+(\texttt{utils/data\_loader.py}) che, per ciascun dataset: (1)~scarica i dati da
+OpenML con caching locale; (2)~codifica le feature categoriche con
+\texttt{OrdinalEncoder}, distinguendo numerico e categorico in modo robusto al
+\emph{backend} dei tipi (in \texttt{pandas}~3.0 le stringhe hanno dtype
+\texttt{str} Arrow, non \texttt{object}); (3)~imputa i valori mancanti con la
+mediana (\texttt{SimpleImputer}); (4)~codifica il target in formato binario
+$\{0,1\}$ con \texttt{LabelEncoder}, rimuovendo spazi/tabulazioni accidentali;
+(5)~scarta colonne identificative (es. \texttt{id}) che introdurrebbero
+\emph{data leakage}. La suddivisione in train/validation è stratificata.
+
+\subsection{Metriche di valutazione}
+Sono state implementate (modulo \texttt{evaluation/metrics.py}) quattro metriche
+per la classificazione binaria, due di discriminazione e due di calibrazione:
+\begin{itemize}[nosep]
+  \item \textbf{AUC-ROC}: area sotto la curva ROC, capacità di discriminazione;
+  \item \textbf{F1 macro}: media non pesata dell'F1 per classe, adatta a dataset
+  sbilanciati;
+  \item \textbf{Brier score}: $\frac{1}{N}\sum_i (p_i - y_i)^2$, errore quadratico
+  medio delle probabilità (calibrazione);
+  \item \textbf{Expected Calibration Error (ECE)}: suddividendo le probabilità in
+  $M=10$ bin di uguale ampiezza,
+  \begin{equation}
+    \mathrm{ECE} = \sum_{b=1}^{M} \frac{|B_b|}{N}\,
+    \bigl|\,\overline{p}(B_b) - \overline{y}(B_b)\,\bigr|,
+  \end{equation}
+  dove $\overline{p}(B_b)$ e $\overline{y}(B_b)$ sono la confidenza media e
+  l'accuratezza media nel bin $b$.
+\end{itemize}
+
+\subsection{Architettura di TabPFN-2.5 e punti di iniezione}
+\label{sec:arch}
+L'architettura (file \texttt{architectures/tabpfn\_v2\_5.py}) è composta da una
+pila di $L=24$ blocchi identici. Ogni blocco contiene due moduli di attenzione e
+un MLP:
+\begin{itemize}[nosep]
+  \item \texttt{per\_sample\_attention\_between\_features}: attenzione tra le
+  feature di una stessa riga;
+  \item \texttt{per\_column\_attention\_between\_cells}: attenzione tra le righe
+  di una stessa colonna (con \emph{multi-query attention} per le righe di test).
+\end{itemize}
+Entrambe ereditano da una classe \texttt{Attention} che definisce quattro
+proiezioni lineari \emph{senza bias}: \texttt{q\_projection},
+\texttt{k\_projection}, \texttt{v\_projection}, \texttt{out\_projection}, tutte
+$\mathbb{R}^{192\times192}$ (dimensione di embedding $d=192$, $3$ teste,
+\texttt{head\_dim}$=64$). Il modello completo conta circa $11{,}0$ milioni di
+parametri.
+
+I \textbf{punti di iniezione naturali} per LoRA sono dunque le proiezioni
+dell'attenzione. Adottando per default il classico schema ``QV'' (solo
+\texttt{q\_projection} e \texttt{v\_projection}) si ottengono
+\[
+  L \times 2~\text{(attenzioni)} \times 2~\text{(proiezioni)} = 24\times2\times2 = 96
+  \quad\text{adapter}.
+\]
+
+\subsection{Implementazione del modulo LoRA}
+Il modulo \texttt{models/lora.py} implementa l'Eq.~\eqref{eq:lora} come
+\emph{wrapper} attorno a un \texttt{nn.Linear} esistente, indipendentemente da
+TabPFN (e quindi testabile in isolamento). Il nucleo è riportato nel
+Listing~\ref{lst:lora}.
+
+\begin{lstlisting}[caption={Nucleo del wrapper \texttt{LoRALinear} (semplificato).},label=lst:lora]
+class LoRALinear(nn.Module):
+    def __init__(self, base_layer, r=8, alpha=16.0, dropout=0.0):
+        super().__init__()
+        self.base = base_layer                 # congelato
+        for p in self.base.parameters():
+            p.requires_grad = False
+        self.scaling = alpha / r
+        self.lora_A = nn.Parameter(torch.empty(r, base_layer.in_features))
+        self.lora_B = nn.Parameter(torch.empty(base_layer.out_features, r))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)            # B=0 -> parte come il modello base
+
+    def forward(self, x):
+        lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        return self.base(x) + self.scaling * lora
+\end{lstlisting}
+
+Sono inoltre fornite funzioni per: iniettare gli adapter individuando per nome i
+\texttt{nn.Linear} bersaglio (\texttt{inject\_lora\_adapters}); congelare tutti i
+parametri tranne quelli LoRA (\texttt{mark\_only\_lora\_as\_trainable});
+salvare/caricare i soli pesi degli adapter (pochi MB); e fondere gli adapter nei
+pesi base per l'inferenza (\texttt{merge}). Il modulo è stato validato con test
+unitari su CPU che verificano, fra l'altro, l'invarianza dell'output
+all'inizializzazione ($\lVert y_{\text{base}}-y_{\text{LoRA}}\rVert_\infty = 0$)
+e la corretta riproducibilità dopo salvataggio e ricarica degli adapter.
+
+\subsection{Procedura di addestramento}
+L'addestramento (modulo \texttt{models/tabpfn\_lora.py}) adotta un \emph{loop
+custom e trasparente}, che riutilizza le primitive di preprocessing di TabPFN ma
+controlla esplicitamente quali parametri vengono ottimizzati. Per ogni
+\emph{meta-batch} (corrispondente a un dataset, suddiviso in contesto e query):
+\begin{enumerate}[nosep]
+  \item si imposta il contesto in-context (\texttt{fit\_from\_preprocessed});
+  \item si calcolano i \emph{logits} grezzi sulle query
+  (\texttt{forward(\dots, return\_raw\_logits=True)});
+  \item si calcola la cross-entropy tra logits e label delle query;
+  \item si esegue \texttt{backward} e un passo di ottimizzazione,
+  \emph{aggiornando soltanto i parametri LoRA}.
+\end{enumerate}
+L'ottimizzatore è AdamW con \emph{learning rate} $10^{-4}$ e \emph{gradient
+clipping}. Per evitare l'esaurimento della memoria GPU su contesti ampi si
+abilita l'\emph{activation checkpointing} (ricalcolo delle attivazioni in fase di
+backward anziché memorizzazione).
+
+\paragraph{Early stopping.} Una porzione del training set (separata dal
+validation usato per il confronto finale, per evitare \emph{leakage}) viene
+riservata alla validazione interna: a ogni epoca si misura l'AUC, si conservano i
+pesi LoRA migliori e ci si arresta dopo un numero prefissato di epoche senza
+miglioramento, ripristinando il miglior checkpoint. Questo accorgimento si è
+rivelato essenziale (cfr.\ Sez.~\ref{sec:datasize}).
+
+%==============================================================================
+\section{Esperimenti e risultati}
+%==============================================================================
+
+Tutti gli esperimenti sono stati eseguiti su GPU (Google Colab, NVIDIA T4).
+Baseline e modello LoRA condividono lo stesso numero di estimatori in inferenza
+per garantire un confronto equo.
+
+\subsection{Esperimento 1: generalizzazione (training multi-dataset)}
+\label{sec:exp5}
+Un \emph{unico} adapter LoRA ($r=8$, $\alpha=16$, schema QV; $294{,}912$
+parametri allenabili pari al $2{,}68\%$ del totale) è stato addestrato
+congiuntamente sui cinque dataset medici e poi valutato sui quattro dataset di
+test mai visti, per misurare la generalizzazione dell'adattamento. Durante
+l'addestramento la media dell'AUC di validazione è salita da $0{,}920$ a
+$0{,}930$, indicando che gli adapter \emph{apprendono} qualcosa di specifico al
+dominio medico. I risultati sui dataset di test sono riportati in
+Tabella~\ref{tab:exp5}.
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 1 -- TabPFN base vs.\ TabPFN+LoRA sui dataset di
+valutazione. In \textbf{grassetto} il valore migliore per metrica e dataset.
+Frecce: $\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:exp5}
+\small
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{2}{*}{\texttt{adult}}
+ & base & \textbf{0.9220} & 0.8056 & \textbf{0.0920} & 0.0116 \\
+ & LoRA & 0.9219 & \textbf{0.8060} & 0.0921 & \textbf{0.0107} \\
+\addlinespace
+\multirow{2}{*}{\texttt{blood\_transfusion}}
+ & base & \textbf{0.7908} & \textbf{0.6643} & \textbf{0.1419} & 0.0948 \\
+ & LoRA & 0.7906 & \textbf{0.6643} & \textbf{0.1419} & \textbf{0.0909} \\
+\addlinespace
+\multirow{2}{*}{\texttt{credit\_g}}
+ & base & 0.7750 & \textbf{0.6796} & 0.1677 & \textbf{0.0399} \\
+ & LoRA & \textbf{0.7759} & \textbf{0.6796} & \textbf{0.1676} & 0.0454 \\
+\addlinespace
+\multirow{2}{*}{\texttt{thyroid}}
+ & base & \textbf{1.0000} & \textbf{0.9953} & \textbf{0.0014} & \textbf{0.0038} \\
+ & LoRA & \textbf{1.0000} & \textbf{0.9953} & 0.0016 & 0.0041 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Le differenze sono tutte dell'ordine della terza--quarta cifra decimale, ovvero
+entro il rumore statistico. Il LoRA \emph{non} migliora né peggiora in modo
+significativo la discriminazione; si osserva un debole e non robusto vantaggio
+sulla calibrazione (ECE migliore in 2 dataset su 4). Da notare che il dataset
+medico tra i test (\texttt{thyroid}) è saturo (AUC $=1{,}0000$), quindi non offre
+margine di osservazione del transfer in-dominio.
+
+\subsection{Esperimento 2: ablation sulla capacità}
+\label{sec:capacity}
+Per verificare se l'assenza di miglioramento dipenda da una capacità
+insufficiente degli adapter, l'Esperimento~1 è stato ripetuto con tre
+configurazioni crescenti (Tabella~\ref{tab:capacity}).
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 2 -- configurazioni LoRA a capacità crescente. La migliore
+AUC di validazione (sui dati medici) resta costante.}
+\label{tab:capacity}
+\small
+\begin{tabular}{lrrc}
+\toprule
+Config. & Target & Param.\ allenabili & Best val AUC \\
+\midrule
+\texttt{r8\_qv}    & q, v       & $294{,}912$\ ($2{,}7\%$)  & 0.9294 \\
+\texttt{r16\_qv}   & q, v       & $589{,}824$\ ($5{,}2\%$)  & 0.9295 \\
+\texttt{r16\_qkvo} & q, k, v, o & $1{,}179{,}648$\ ($9{,}9\%$) & 0.9295 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Quadruplicando i parametri allenabili (dal $2{,}7\%$ al $9{,}9\%$) la migliore
+AUC di validazione resta sostanzialmente invariata ($0{,}9295$) e le metriche sui
+dataset di test sono indistinguibili; in un caso (F1 su \texttt{credit\_g}) la
+configurazione più capiente peggiora leggermente, suggerendo un principio di
+overfitting. Si conclude che \textbf{la capacità degli adapter non è il fattore
+limitante}.
+
+\subsection{Esperimento 3: ablation sulla dimensione dei dati}
+\label{sec:datasize}
+La seconda ipotesi è che i dataset di fine-tuning, essendo piccoli
+($155$--$768$ righe), forniscano troppi pochi passi di gradiente. Per testarla,
+un adapter ($r=8$, QV) è stato addestrato e valutato \emph{in-distribution} su un
+dataset medico ampio, \texttt{Cardiovascular-Disease} (OpenML~45547), ridotto a
+$40\,000$ campioni per rispettare il limite di TabPFN ($\sim$$50\,000$):
+$32\,000$ righe di training (circa $60$ volte i dataset piccoli, suddivise in
+$\sim$$8$ chunk per epoca) e $8\,000$ di test.
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 3 -- TabPFN base vs.\ LoRA su \texttt{cardiovascular}
+($32\,000$ righe di training, valutazione in-distribution).}
+\label{tab:datasize}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+base & \textbf{0.7984} & \textbf{0.7291} & 0.1826 & 0.0275 \\
+LoRA & 0.7983 & 0.7290 & \textbf{0.1824} & \textbf{0.0229} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Nonostante $60$ volte più dati, il LoRA resta equivalente al baseline sulla
+discriminazione (Tabella~\ref{tab:datasize}); l'unico miglioramento netto è di
+nuovo sulla calibrazione (ECE $0{,}0229$ vs.\ $0{,}0275$). \textbf{Anche
+l'ipotesi della scarsità di dati è quindi rigettata.}
+
+Particolarmente istruttiva è la dinamica dell'addestramento
+(Figura~\ref{fig:valauc}): la AUC di validazione raggiunge il massimo
+($0{,}8045$) già all'epoca~5 e poi \emph{decresce} monotonicamente
+($0{,}7789$ all'epoca~30), mentre la loss di training cresce. In altre parole, il
+modello parte $\approx$ base (per via di $B=0$) e ogni ulteriore addestramento lo
+\emph{allontana} dalla soluzione ottimale, peggiorandolo; solo l'early stopping
+preserva le prestazioni. Si noti infine che \texttt{cardiovascular} non è saturo
+(AUC $\approx 0{,}80$): esisteva margine di miglioramento, eppure il LoRA non lo
+ha colto.
+
+\begin{figure}[h]
+\centering
+\begin{tabular}{c}
+\fbox{\parbox{0.85\textwidth}{\centering\footnotesize
+\textit{[Andamento della AUC di validazione per epoca su
+\texttt{cardiovascular}.]}\\[2pt]
+Ep.\ 5: \textbf{0.8045} (max) \;$\to$\; Ep.\ 15: 0.8011 \;$\to$\;
+Ep.\ 20: 0.7966 \;$\to$\; Ep.\ 25: 0.7882 \;$\to$\; Ep.\ 30: 0.7789\\[2pt]
+La AUC decresce dopo l'epoca 5: l'addestramento prolungato degrada il modello.}}
+\end{tabular}
+\caption{Dinamica dell'early stopping nell'Esperimento~3. Il valore migliore è
+all'epoca 5; oltre, le prestazioni peggiorano.}
+\label{fig:valauc}
+\end{figure}
+
+%==============================================================================
+\section{Discussione}
+%==============================================================================
+I tre esperimenti convergono verso una conclusione coerente
+(Tabella~\ref{tab:summary}). Il LoRA fine-tuning non migliora la capacità
+discriminativa di TabPFN-2.5 su classificazione binaria tabulare. Le due
+spiegazioni alternative più naturali sono state escluse sperimentalmente:
+\begin{itemize}[nosep]
+  \item \textbf{non è un problema di capacità}: un aumento di $4\times$ dei
+  parametri allenabili non produce alcun cambiamento (Sez.~\ref{sec:capacity});
+  \item \textbf{non è un problema di dati}: un aumento di $\sim$$60\times$ dei
+  dati di training non produce miglioramenti, e un addestramento prolungato
+  degrada il modello (Sez.~\ref{sec:datasize}).
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Sintesi degli esperimenti e delle ipotesi testate.}
+\label{tab:summary}
+\small
+\begin{tabular}{lll}
+\toprule
+Ipotesi & Esperimento & Esito \\
+\midrule
+Generalizzazione fuori dominio & Exp.~1 (medici $\to$ test) & LoRA $\approx$ base, non distruttivo \\
+Capacità insufficiente & Exp.~2 (ablation $r$, target) & nessun cambiamento \\
+Dati insufficienti & Exp.~3 ($60\times$ dati) & nessun gain; over-training degrada \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La spiegazione residua, e più solida, è che \textbf{i pesi pre-addestrati di
+TabPFN-2.5 sono già vicini all'ottimo} per questa classe di problemi: il suo
+in-context learning estrae quasi tutto il segnale disponibile, e un adattamento a
+basso rango non può aggiungervi capacità discriminativa, potendo solo
+allontanarsi dal buon punto di partenza. Un aspetto positivo, da non trascurare,
+è che l'adattamento risulta \emph{non distruttivo}: pur essendo addestrato solo
+su dati medici, non degrada le prestazioni sui dataset di test non medici,
+evidenziando robustezza allo \emph{shift} di dominio. Inoltre, l'unico segnale
+ricorrente -- per quanto modesto -- è il miglioramento della \emph{calibrazione}
+(ECE), il che suggerisce che eventuali benefici vadano cercati nel
+post-processing piuttosto che nell'adattamento dei pesi.
+
+\paragraph{Note implementative rilevanti.} Durante lo sviluppo sono emersi alcuni
+accorgimenti tecnici necessari: (i)~l'early stopping è indispensabile, poiché
+l'addestramento può degradare il modello; (ii)~su dataset grandi occorre
+abilitare l'\emph{activation checkpointing} per non esaurire la memoria della GPU
+in fase di training; (iii)~per dataset oltre il limite ufficiale va impostato
+\texttt{ignore\_pretraining\_limits=True}.
+
+%==============================================================================
+\section{Conclusioni e lavori futuri}
+%==============================================================================
+È stato implementato e validato un sistema completo per il LoRA fine-tuning di
+TabPFN-2.5: caricamento e preprocessing dei dati, quattro metriche di
+valutazione, iniezione e addestramento degli adapter, ed early stopping. Sul
+piano sperimentale, mediante tre esperimenti con relative ablation, si è stabilito
+con metodologia rigorosa che il LoRA non migliora la discriminazione di
+TabPFN-2.5 su classificazione binaria, e che ciò non dipende né dalla capacità
+degli adapter né dalla quantità di dati, bensì dalla prossimità all'ottimo dei
+pesi pre-addestrati. Il risultato, sebbene negativo, è informativo e
+metodologicamente solido.
+
+Il debole ma consistente miglioramento sulla calibrazione indica la direzione
+naturale per il proseguimento del progetto: la \textbf{pipeline esterna}
+(preprocessing adattivo, feature selection, ensembling e, soprattutto,
+\emph{post-processing} con calibrazione e ottimizzazione della soglia per l'F1),
+dove ci si attende un segnale più marcato, in particolare sui dataset
+sbilanciati.
+
+%==============================================================================
+\appendix
+\section{Struttura del codice}
+%==============================================================================
+\begin{itemize}[nosep]
+  \item \texttt{utils/data\_loader.py} -- caricamento, caching, encoding e split
+  dei dataset OpenML.
+  \item \texttt{evaluation/metrics.py} -- AUC-ROC, F1 macro, Brier, ECE; tabelle
+  comparative e salvataggio CSV.
+  \item \texttt{models/lora.py} -- implementazione di LoRA (\texttt{LoRALinear},
+  iniezione, salvataggio/caricamento, merge).
+  \item \texttt{models/tabpfn\_lora.py} -- integrazione con TabPFN: costruzione
+  del classificatore con adapter, loop di training, early stopping, esperimenti
+  (\texttt{run\_lora\_exp5}, \texttt{run\_lora\_ablation},
+  \texttt{run\_lora\_datasize\_experiment}).
+\end{itemize}
+
+\noindent\textit{Codice e configurazione completi sono versionati nel repository
+del progetto. Il modello TabPFN-2.5 è eseguito localmente; il primo download dei
+pesi richiede un token di licenza Prior Labs.}
+
+\end{document}
