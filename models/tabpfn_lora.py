@@ -916,6 +916,85 @@ def run_lora_exp5(
     return df, history
 
 
+def run_lora_ablation(
+    configs: List[LoRAConfig],
+    config_names: List[str],
+    *,
+    finetune_names: List[str] | None = None,
+    eval_names: List[str] | None = None,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
+    device: str = "cuda",
+    n_estimators_train: int = 2,
+    n_estimators_eval: int = 8,
+    random_state: int = 42,
+    verbose: bool = True,
+) -> Any:
+    """Ablation degli iperparametri LoRA: confronta piu' configurazioni.
+
+    Per ciascuna ``LoRAConfig`` esegue :func:`run_lora_exp5` (training sui
+    dataset medici + valutazione su quelli di test) e raccoglie i risultati in
+    un'unica tabella, con il baseline (TabPFN senza LoRA) riportato una sola
+    volta. Serve a verificare se aumentando capacita'/target il LoRA cambia
+    qualcosa, oppure se TabPFN e' davvero al soffitto.
+
+    Args:
+        configs: Lista di configurazioni LoRA da confrontare.
+        config_names: Etichette brevi per ciascuna config (stessa lunghezza).
+        finetune_names: Dataset di training (default: tutti i medici).
+        eval_names: Dataset di valutazione (default: tutti i test).
+        epochs, learning_rate, device, n_estimators_train, n_estimators_eval,
+        random_state, verbose: come in :func:`run_lora_exp5`.
+
+    Returns:
+        Un ``pd.DataFrame`` con una riga per (dataset, modello), dove i modelli
+        sono ``TabPFN-base`` piu' una riga per ogni configurazione LoRA.
+    """
+    import pandas as pd
+
+    try:
+        from evaluation.metrics import print_comparison_table
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Assicurati che la root del progetto sia nel sys.path."
+        ) from exc
+
+    if len(configs) != len(config_names):
+        raise ValueError("configs e config_names devono avere la stessa lunghezza.")
+
+    combined = []
+    base_rows = None
+
+    for cfg, name in zip(configs, config_names):
+        if verbose:
+            print(f"\n{'#' * 66}\n# Configurazione LoRA: {name}\n{'#' * 66}")
+        df, _ = run_lora_exp5(
+            lora_config=cfg,
+            finetune_names=finetune_names,
+            eval_names=eval_names,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            device=device,
+            n_estimators_train=n_estimators_train,
+            n_estimators_eval=n_estimators_eval,
+            random_state=random_state,
+            save_path=None,
+            verbose=verbose,
+        )
+        loras = df[df["model"] == "TabPFN-LoRA"].copy()
+        loras["model"] = f"LoRA-{name}"
+        combined.append(loras)
+        if base_rows is None:
+            base_rows = df[df["model"] == "TabPFN-base"].copy()
+
+    final = pd.concat([base_rows, *combined], ignore_index=True)
+    if verbose:
+        print(f"\n{'=' * 66}\nTABELLA ABLATION (base vs configurazioni LoRA)\n{'=' * 66}")
+        print_comparison_table(final)
+
+    return final
+
+
 if __name__ == "__main__":
     # Questo modulo richiede tabpfn + GPU e va eseguito su Colab.
     # In locale serve solo a verificare che la sintassi sia corretta.
