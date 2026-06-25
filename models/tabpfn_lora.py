@@ -916,6 +916,150 @@ def run_lora_exp5(
     return df, history
 
 
+def run_lora_datasize_experiment(
+    dataset_id: int,
+    dataset_name: str = "dataset",
+    *,
+    lora_config: LoRAConfig | None = None,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
+    device: str = "cuda",
+    n_estimators_train: int = 2,
+    n_estimators_eval: int = 8,
+    n_ctx_plus_query: int = 10_000,
+    eval_every: int = 5,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    save_path: str | None = None,
+    verbose: bool = True,
+) -> Tuple[Any, List[float]]:
+    """Esperimento sulla dimensione dei dati: LoRA su un dataset GRANDE, in-distribution.
+
+    Verifica l'ipotesi "il LoRA non migliora perche' i dataset sono troppo
+    piccoli". Carica un dataset grande (per ID OpenML), allena il LoRA su una sua
+    parte e confronta base vs LoRA sul suo test. Con molti dati il training viene
+    spezzato in molti chunk (molti piu' passi di gradiente dei dataset piccoli):
+    se il LoRA ora migliora, era sotto-allenato; se resta neutro, e' il soffitto
+    di TabPFN.
+
+    Args:
+        dataset_id: ID OpenML del dataset (grande) da usare.
+        dataset_name: Nome leggibile per la tabella.
+        lora_config: Configurazione LoRA (default ``r=8, alpha=16``, q/v).
+        epochs: Epoche di training.
+        learning_rate: Learning rate degli adapter.
+        device: Device di calcolo.
+        n_estimators_train: Estimatori in training/early-stopping.
+        n_estimators_eval: Estimatori nella valutazione finale.
+        n_ctx_plus_query: Dimensione massima di ogni chunk (contesto+query); un
+            dataset grande viene spezzato in piu' chunk di questa dimensione.
+        eval_every: Ogni quante epoche valutare l'early stopping (piu' alto =
+            piu' veloce su dataset grandi).
+        test_size: Frazione tenuta come test per il confronto finale.
+        random_state: Seed.
+        save_path: Se fornito, salva i pesi LoRA.
+        verbose: Se True, stampa avanzamento e tabella.
+
+    Returns:
+        Tupla ``(df, history)`` con il confronto base vs LoRA e la curva di loss.
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    from sklearn.model_selection import train_test_split
+
+    from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
+
+    try:
+        from utils.data_loader import load_dataset
+        from evaluation.metrics import (
+            evaluate_model,
+            evaluate_multiple_datasets,
+            print_comparison_table,
+        )
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("Root del progetto non nel sys.path.") from exc
+
+    if lora_config is None:
+        lora_config = LoRAConfig()
+
+    # --- Carica e splitta ------------------------------------------------
+    X, y = load_dataset(dataset_id)
+    X_tr, X_te, y_tr, y_te = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=y
+    )
+    if verbose:
+        print(f"\n{dataset_name}: train={len(y_tr)}, test={len(y_te)} "
+              f"(chunk da {n_ctx_plus_query} -> ~{max(1, len(y_tr) // n_ctx_plus_query)} "
+              f"batch/epoca, molti piu' passi dei dataset piccoli)")
+
+    # --- 1. Baseline -----------------------------------------------------
+    if verbose:
+        print("\n[1/3] Valuto TabPFN base...")
+    base = TabPFNClassifier.create_default_for_version(
+        version=ModelVersion.V2_5,
+        device=device,
+        n_estimators=n_estimators_eval,
+        random_state=random_state,
+    )
+    base.fit(X_tr, y_tr)
+    prob_base = base.predict_proba(X_te)[:, 1]
+    res_base = evaluate_model(y_te, prob_base, "TabPFN-base", dataset_name)
+    del base
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- 2. Training LoRA (molti chunk) ----------------------------------
+    if verbose:
+        print(f"\n[2/3] Alleno il LoRA su {len(y_tr)} righe...")
+    clf, injected = create_lora_classifier(
+        lora_config,
+        device=device,
+        n_estimators=n_estimators_train,
+        random_state=random_state,
+    )
+    history = train_lora(
+        clf,
+        X_tr,
+        y_tr,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        device=device,
+        n_ctx_plus_query=n_ctx_plus_query,
+        eval_every=eval_every,
+        random_state=random_state,
+        n_estimators_eval=n_estimators_train,
+        verbose=verbose,
+    )
+
+    # --- 3. Valutazione LoRA ---------------------------------------------
+    if verbose:
+        print("\n[3/3] Valuto TabPFN+LoRA...")
+    eval_args = {
+        "device": device,
+        "n_estimators": n_estimators_eval,
+        "random_state": random_state,
+    }
+    lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+    lora_infer.fit(X_tr, y_tr)
+    prob_lora = lora_infer.predict_proba(X_te)[:, 1]
+    res_lora = evaluate_model(y_te, prob_lora, "TabPFN-LoRA", dataset_name)
+
+    df = evaluate_multiple_datasets([res_base, res_lora])
+    if verbose:
+        print_comparison_table(df)
+
+    if save_path is not None:
+        save_lora_adapters(clf.model_, save_path)
+        if verbose:
+            print(f"Pesi LoRA salvati in '{save_path}'")
+
+    return df, history
+
+
 def run_lora_ablation(
     configs: List[LoRAConfig],
     config_names: List[str],
