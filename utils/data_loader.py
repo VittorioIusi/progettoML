@@ -53,7 +53,7 @@ FINETUNE_DATASETS: Dict[str, int] = {
 }
 
 EVALUATION_DATASETS: Dict[str, int] = {
-    "thyroid": 40082,
+    "thyroid": 1000,
     "adult": 1590,
     "credit_g": 31,
     "blood_transfusion": 1464,

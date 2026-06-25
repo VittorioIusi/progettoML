@@ -60,9 +60,11 @@ python models/lora.py
 
 - **Fine-tuning LoRA** (medici): diabetes (37), breast_cancer (1510),
   heart_disease (53), chronic_kidney (42972), hepatitis (55).
-- **Valutazione**: thyroid (40082), adult (1590), credit_g (31),
+- **Valutazione**: thyroid (1000), adult (1590), credit_g (31),
   blood_transfusion (1464).
 
-> Nota: per `chronic_kidney` si usa l'OpenML ID **42972** (`chronic-kidney-disease`).
-> L'ID 40922 inizialmente indicato corrisponde a un dataset diverso
-> (`Run_or_walk_information`) e non va usato.
+> Nota sugli ID OpenML corretti (alcuni ID iniziali erano errati):
+> - `chronic_kidney` usa **42972** (`chronic-kidney-disease`); l'ID 40922 era
+>   `Run_or_walk_information` (non pertinente).
+> - `thyroid` usa **1000** (`hypothyroid`, binario); l'ID 40082 era un dataset
+>   di chimica con 347 classi (`QSAR-DATASET-...`), non binario.
