@@ -368,6 +368,142 @@ def finetune_lora_on_dataset(
     return clf, history
 
 
+def evaluate_lora_vs_baseline(
+    dataset_name: str,
+    *,
+    lora_config: LoRAConfig | None = None,
+    epochs: int = 30,
+    learning_rate: float = 1e-3,
+    device: str = "cuda",
+    n_estimators_train: int = 2,
+    n_estimators_eval: int = 8,
+    random_state: int = 42,
+    save_path: str | None = None,
+    verbose: bool = True,
+) -> Tuple[Any, List[float]]:
+    """Confronta TabPFN base vs TabPFN+LoRA su un dataset di fine-tuning.
+
+    Esegue, nell'ordine:
+        1. Valuta il TabPFN **base** (senza LoRA) sul validation set.
+        2. Allena gli adapter LoRA sul training set.
+        3. Clona il modello allenato per l'inferenza standard e lo valuta sullo
+           stesso validation set.
+        4. Costruisce e stampa la tabella di confronto con le metriche del
+           progetto (AUC-ROC, F1 macro, Brier, ECE).
+
+    Baseline e modello LoRA usano lo **stesso** numero di estimatori in
+    inferenza (``n_estimators_eval``) per un confronto equo; il training del
+    LoRA puo' usare meno estimatori (``n_estimators_train``) per velocita'.
+
+    Args:
+        dataset_name: Nome del dataset in ``FINETUNE_DATASETS`` (es. ``"diabetes"``).
+        lora_config: Configurazione LoRA (default ``r=8, alpha=16``, target q/v).
+        epochs: Numero di epoche di training degli adapter.
+        learning_rate: Learning rate per gli adapter.
+        device: Device di calcolo.
+        n_estimators_train: Numero di estimatori usati durante il training LoRA.
+        n_estimators_eval: Numero di estimatori usati in inferenza per ENTRAMBI
+            i modelli (confronto equo).
+        random_state: Seed.
+        save_path: Se fornito, salva i pesi LoRA in questo file ``.pt``.
+        verbose: Se True, stampa avanzamento, tabella di confronto e statistiche.
+
+    Returns:
+        Tupla ``(df, history)`` dove ``df`` e' il DataFrame di confronto (una riga
+        per modello) e ``history`` la lista delle loss di training per epoca.
+    """
+    from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
+
+    try:
+        from utils.data_loader import get_finetune_data
+        from evaluation.metrics import (
+            evaluate_model,
+            evaluate_multiple_datasets,
+            print_comparison_table,
+        )
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError(
+            "Assicurati che la root del progetto sia nel sys.path "
+            "(es. sys.path.insert(0, '/content/progettoML'))."
+        ) from exc
+
+    if lora_config is None:
+        lora_config = LoRAConfig()
+
+    X_train, y_train, X_val, y_val = get_finetune_data(
+        dataset_name, random_state=random_state
+    )
+
+    # --- 1. Baseline: TabPFN v2.5 senza LoRA ------------------------------
+    if verbose:
+        print(f"\n[1/3] Valuto TabPFN base su '{dataset_name}'...")
+    base = TabPFNClassifier.create_default_for_version(
+        version=ModelVersion.V2_5,
+        device=device,
+        n_estimators=n_estimators_eval,
+        random_state=random_state,
+    )
+    base.fit(X_train, y_train)
+    prob_base = base.predict_proba(X_val)[:, 1]
+    res_base = evaluate_model(y_val, prob_base, "TabPFN-base", dataset_name)
+
+    # Libera memoria GPU prima del training.
+    del base
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # --- 2. Training degli adapter LoRA -----------------------------------
+    if verbose:
+        print(f"\n[2/3] Alleno gli adapter LoRA ({epochs} epoche)...")
+    clf, injected = create_lora_classifier(
+        lora_config,
+        device=device,
+        n_estimators=n_estimators_train,
+        random_state=random_state,
+    )
+    if verbose:
+        tr, tot, pct = count_trainable_parameters(clf.model_)
+        print(f"  adapter={len(injected)} | allenabili={tr:,}/{tot:,} ({pct:.3f}%)")
+
+    history = train_lora(
+        clf,
+        X_train,
+        y_train,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        device=device,
+        random_state=random_state,
+        verbose=verbose,
+    )
+
+    # --- 3. Valutazione del modello LoRA (clone per inferenza) ------------
+    if verbose:
+        print(f"\n[3/3] Valuto TabPFN+LoRA su '{dataset_name}'...")
+    eval_args = {
+        "device": device,
+        "n_estimators": n_estimators_eval,
+        "random_state": random_state,
+    }
+    lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+    lora_infer.fit(X_train, y_train)
+    prob_lora = lora_infer.predict_proba(X_val)[:, 1]
+    res_lora = evaluate_model(y_val, prob_lora, "TabPFN-LoRA", dataset_name)
+
+    # --- 4. Confronto -----------------------------------------------------
+    df = evaluate_multiple_datasets([res_base, res_lora])
+    if verbose:
+        print_comparison_table(df)
+
+    if save_path is not None:
+        save_lora_adapters(clf.model_, save_path)
+        if verbose:
+            print(f"Pesi LoRA salvati in '{save_path}'")
+
+    return df, history
+
+
 if __name__ == "__main__":
     # Questo modulo richiede tabpfn + GPU e va eseguito su Colab.
     # In locale serve solo a verificare che la sintassi sia corretta.

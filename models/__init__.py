@@ -13,6 +13,7 @@ from .lora import (
 )
 from .tabpfn_lora import (
     create_lora_classifier,
+    evaluate_lora_vs_baseline,
     finetune_lora_on_dataset,
     train_lora,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "LoRALinear",
     "count_trainable_parameters",
     "create_lora_classifier",
+    "evaluate_lora_vs_baseline",
     "finetune_lora_on_dataset",
     "inject_lora_adapters",
     "load_lora_adapters",
