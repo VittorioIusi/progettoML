@@ -152,6 +152,7 @@ def train_lora(
     patience: int = 10,
     eval_every: int = 1,
     n_estimators_eval: int = 2,
+    use_activation_checkpointing: bool = True,
     verbose: bool = True,
 ) -> List[float]:
     """Allena i soli adapter LoRA di ``clf``, con early stopping su validation.
@@ -219,10 +220,10 @@ def train_lora(
         trainable_params, lr=learning_rate, weight_decay=weight_decay
     )
 
-    # Niente activation checkpointing per semplicita'/robustezza alla prima
-    # versione; i dataset medici sono piccoli e stanno in memoria su una T4.
+    # Activation checkpointing: ricalcola le attivazioni nel backward invece di
+    # tenerle in memoria. Indispensabile per non andare OOM su chunk grandi.
     perf = PerformanceOptions(
-        force_recompute_layer=False,
+        force_recompute_layer=use_activation_checkpointing,
         use_chunkwise_inference=False,
     )
 
@@ -603,6 +604,7 @@ def train_lora_multi(
     patience: int = 10,
     eval_every: int = 2,
     n_estimators_eval: int = 2,
+    use_activation_checkpointing: bool = True,
     verbose: bool = True,
 ) -> List[float]:
     """Allena i soli adapter LoRA su PIU' dataset congiuntamente.
@@ -645,7 +647,8 @@ def train_lora_multi(
         trainable_params, lr=learning_rate, weight_decay=weight_decay
     )
     perf = PerformanceOptions(
-        force_recompute_layer=False, use_chunkwise_inference=False
+        force_recompute_layer=use_activation_checkpointing,
+        use_chunkwise_inference=False,
     )
 
     # Split train/early-stopping per ciascun dataset.
@@ -929,7 +932,7 @@ def run_lora_datasize_experiment(
     device: str = "cuda",
     n_estimators_train: int = 2,
     n_estimators_eval: int = 8,
-    n_ctx_plus_query: int = 10_000,
+    n_ctx_plus_query: int = 4_000,
     eval_every: int = 5,
     test_size: float = 0.2,
     max_samples: int = 40_000,
