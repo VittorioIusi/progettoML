@@ -687,12 +687,15 @@ def train_lora_multi(
 
         # Un batch per dataset: split contesto/query per frazione.
         splitter = partial(train_test_split, test_size=query_ratio, random_state=seed)
+        # max_data_size=None: usa ogni dataset INTERO senza chunking. Necessario
+        # perche' il chunker di TabPFN scarta i dataset piu' piccoli di 2000
+        # righe (min_chunk_size), e i nostri dataset medici sono tutti piccoli.
         datasets = get_preprocessed_dataset_chunks(
             calling_instance=clf,
             X_raw=X_list,
             y_raw=y_list,
             split_fn=splitter,
-            max_data_size=n_ctx_plus_query,
+            max_data_size=None,
             model_type="classifier",
             equal_split_size=False,
             data_shuffle_seed=seed,
