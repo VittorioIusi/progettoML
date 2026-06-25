@@ -523,6 +523,7 @@ def evaluate_lora_vs_baseline(
         device=device,
         n_estimators=n_estimators_eval,
         random_state=random_state,
+        ignore_pretraining_limits=True,
     )
     base.fit(X_train, y_train)
     prob_base = base.predict_proba(X_val)[:, 1]
@@ -565,6 +566,7 @@ def evaluate_lora_vs_baseline(
         "device": device,
         "n_estimators": n_estimators_eval,
         "random_state": random_state,
+        "ignore_pretraining_limits": True,
     }
     lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
     lora_infer.fit(X_train, y_train)
@@ -880,6 +882,7 @@ def run_lora_exp5(
         "device": device,
         "n_estimators": n_estimators_eval,
         "random_state": random_state,
+        "ignore_pretraining_limits": True,
     }
     for name in eval_names:
         if verbose:
@@ -929,6 +932,7 @@ def run_lora_datasize_experiment(
     n_ctx_plus_query: int = 10_000,
     eval_every: int = 5,
     test_size: float = 0.2,
+    max_samples: int = 40_000,
     random_state: int = 42,
     save_path: str | None = None,
     verbose: bool = True,
@@ -988,6 +992,18 @@ def run_lora_datasize_experiment(
 
     # --- Carica e splitta ------------------------------------------------
     X, y = load_dataset(dataset_id)
+
+    # Limita la dimensione per restare nel regime supportato da TabPFN (50k) ed
+    # evitare OOM su GPU piccole, mantenendo comunque MOLTI piu' dati dei
+    # dataset medici piccoli.
+    if len(y) > max_samples:
+        from sklearn.model_selection import train_test_split as _tts
+        X, _, y, _ = _tts(
+            X, y, train_size=max_samples, random_state=random_state, stratify=y
+        )
+        if verbose:
+            print(f"Dataset ridotto a {max_samples} campioni (limite TabPFN ~50k).")
+
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
@@ -1004,6 +1020,7 @@ def run_lora_datasize_experiment(
         device=device,
         n_estimators=n_estimators_eval,
         random_state=random_state,
+        ignore_pretraining_limits=True,
     )
     base.fit(X_tr, y_tr)
     prob_base = base.predict_proba(X_te)[:, 1]
@@ -1042,6 +1059,7 @@ def run_lora_datasize_experiment(
         "device": device,
         "n_estimators": n_estimators_eval,
         "random_state": random_state,
+        "ignore_pretraining_limits": True,
     }
     lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
     lora_infer.fit(X_tr, y_tr)
