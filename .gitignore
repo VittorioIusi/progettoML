@@ -1,0 +1,21 @@
+# Segreti / credenziali — NON committare mai
+.env
+*.token
+auth_token
+
+# Cache dei dataset OpenML scaricati
+data/raw/
+
+# Pesi dei modelli TabPFN (scaricati, pesanti)
+*.ckpt
+
+# Risultati esperimenti generati
+results/
+
+# Artefatti Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/

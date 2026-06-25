@@ -1,0 +1,11 @@
+# Dipendenze del progetto (oltre a TabPFN).
+# TabPFN stesso si installa dal sorgente incluso:
+#     pip install -e ./TabPFN-main
+#
+# Su Google Colab torch e' gia' preinstallato con supporto CUDA:
+# NON aggiungere torch qui per non forzarne la reinstallazione.
+
+openml>=0.15
+scikit-learn>=1.3
+numpy
+pandas
