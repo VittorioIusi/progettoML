@@ -59,6 +59,21 @@ EVALUATION_DATASETS: Dict[str, int] = {
     "blood_transfusion": 1464,
 }
 
+# Dataset usati per gli esperimenti della pipeline esterna (ensembling,
+# calibrazione, ottimizzazione della soglia). Riprende i 4 dataset di
+# valutazione del capitolo LoRA (continuita' e confronto diretto) e aggiunge
+# due dataset binari di grandi dimensioni, in modo che le conclusioni su
+# calibrazione/soglia poggino su campioni sufficientemente grandi da rendere
+# stabili metriche come l'ECE.
+PIPELINE_DATASETS: Dict[str, int] = {
+    "blood_transfusion": 1464,   # ~748 righe   (piccolo)
+    "credit_g": 31,              # ~1.000 righe (piccolo)
+    "thyroid": 1000,             # ~3.772 righe (medio, AUC saturo)
+    "adult": 1590,               # ~48.842 righe (grande)
+    "bank_marketing": 1461,      # ~45.211 righe (grande)
+    "magic_telescope": 1120,     # ~19.020 righe (grande)
+}
+
 # Cartella usata per il caching dei dataset gia' scaricati ed elaborati.
 # Il percorso e' calcolato relativamente alla root del progetto (due livelli
 # sopra questo file: utils/ -> tabpfn_project/ -> root del progetto).
