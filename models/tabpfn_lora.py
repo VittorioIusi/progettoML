@@ -694,7 +694,7 @@ def train_lora_multi(
         splitter = partial(train_test_split, test_size=query_ratio, random_state=seed)
         # max_data_size=None: usa ogni dataset INTERO senza chunking. Necessario
         # perche' il chunker di TabPFN scarta i dataset piu' piccoli di 2000
-        # righe (min_chunk_size), e i nostri dataset medici sono tutti piccoli.
+        # righe (min_chunk_size); alcuni dataset finanziari possono essere piccoli.
         datasets = get_preprocessed_dataset_chunks(
             calling_instance=clf,
             X_raw=X_list,
@@ -785,11 +785,15 @@ def run_lora_exp5(
     save_path: str | None = None,
     verbose: bool = True,
 ) -> Tuple[Any, List[float]]:
-    """Esperimento 5: LoRA addestrato sui dataset medici, valutato su quelli di test.
+    """Esperimento 1: generalizzazione IN-DOMAIN (finanziario -> finanziario).
 
-    Allena UN solo LoRA congiuntamente sui dataset di fine-tuning (medici) e poi
-    confronta TabPFN base vs TabPFN+LoRA sui dataset di valutazione (mai visti in
-    training), misurando cosi' la **generalizzazione** dell'adattamento LoRA.
+    Allena UN solo LoRA congiuntamente sui dataset di fine-tuning (dominio
+    finanziario/creditizio) e poi confronta TabPFN base vs TabPFN+LoRA sui
+    dataset di valutazione finanziari (mai visti in training), misurando la
+    **generalizzazione in-domain** dell'adattamento LoRA: il LoRA riesce a
+    specializzare TabPFN su uno specifico settore? La precedente configurazione
+    era cross-domain (medico -> non medico); ora e' in-domain, coerente con la
+    domanda di ricerca.
 
     Args:
         finetune_names: Nomi dei dataset di training (default: tutti i
@@ -843,7 +847,7 @@ def run_lora_exp5(
     if lora_config is None:
         lora_config = LoRAConfig()
 
-    # --- 1. Carica i dataset medici di training --------------------------
+    # --- 1. Carica i dataset finanziari di training ----------------------
     if verbose:
         print(f"Carico {len(finetune_names)} dataset di fine-tuning: {finetune_names}")
     train_datasets = []
@@ -861,7 +865,7 @@ def run_lora_exp5(
     if verbose:
         tr, tot, pct = count_trainable_parameters(clf.model_)
         print(f"adapter={len(injected)} | allenabili={tr:,}/{tot:,} ({pct:.3f}%)")
-        print(f"Alleno UN LoRA su {len(train_datasets)} dataset medici insieme...\n")
+        print(f"Alleno UN LoRA su {len(train_datasets)} dataset finanziari insieme...\n")
 
     history = train_lora_multi(
         clf,
@@ -942,6 +946,11 @@ def run_lora_datasize_experiment(
 ) -> Tuple[Any, List[float]]:
     """Esperimento sulla dimensione dei dati: LoRA su un dataset GRANDE, in-distribution.
 
+    NOTA: nella configurazione finanziaria questo esperimento (Esperimento 3) e'
+    stato SOSTITUITO da :func:`run_lora_datasize_financial`, che usa
+    campionamenti multipli di ``gmsc`` con test set fisso invece di un singolo
+    dataset. Questa funzione resta disponibile come variante a punto singolo.
+
     Verifica l'ipotesi "il LoRA non migliora perche' i dataset sono troppo
     piccoli". Carica un dataset grande (per ID OpenML), allena il LoRA su una sua
     parte e confronta base vs LoRA sul suo test. Con molti dati il training viene
@@ -998,7 +1007,7 @@ def run_lora_datasize_experiment(
 
     # Limita la dimensione per restare nel regime supportato da TabPFN (50k) ed
     # evitare OOM su GPU piccole, mantenendo comunque MOLTI piu' dati dei
-    # dataset medici piccoli.
+    # dataset di fine-tuning piu' piccoli.
     if len(y) > max_samples:
         from sklearn.model_selection import train_test_split as _tts
         X, _, y, _ = _tts(
@@ -1081,6 +1090,264 @@ def run_lora_datasize_experiment(
     return df, history
 
 
+def run_lora_datasize_financial(
+    *,
+    dataset_id: int = 45577,
+    dataset_name: str = "gmsc",
+    train_sizes: List[int] | None = None,
+    test_size_fixed: int = 8_000,
+    lora_config: LoRAConfig | None = None,
+    epochs: int = 50,
+    learning_rate: float = 1e-4,
+    device: str = "cuda",
+    n_estimators_train: int = 2,
+    n_estimators_eval: int = 8,
+    n_ctx_plus_query: int = 4_000,
+    eval_every: int = 5,
+    random_state: int = 42,
+    plot_path: str | None = "results/datasize_financial_auc.png",
+    csv_path: str | None = "results/datasize_financial.csv",
+    save_path: str | None = None,
+    verbose: bool = True,
+) -> Any:
+    """Ablation sulla dimensione dei dati in dominio FINANZIARIO (gmsc).
+
+    Sostituisce il vecchio ``run_lora_datasize_experiment`` su un singolo
+    ``cardiovascular`` con un'analisi a piu' punti su ``gmsc``
+    (GiveMeSomeCredit, OpenML 45577, ~150.000 righe). Misura come variano le
+    prestazioni di TabPFN base vs TabPFN+LoRA al crescere della dimensione del
+    training set, su un **test set fisso** (mai modificato), per isolare
+    l'effetto della sola quantita' di dati di addestramento.
+
+    Procedura:
+      1. verifica l'identita' di ``gmsc`` su OpenML;
+      2. ritaglia (stratificato) un test set fisso di ``test_size_fixed`` righe,
+         che resta invariato per tutte le dimensioni;
+      3. per ogni dimensione in ``train_sizes`` campiona (stratificato) un
+         training set dal resto, allena il LoRA e confronta base vs LoRA sul
+         test fisso (AUC-ROC, F1 macro, Brier, ECE);
+      4. produce una tabella e un grafico della curva AUC vs dimensione,
+         separata per base e LoRA.
+
+    Tutte le configurazioni rispettano il limite di TabPFN: con
+    ``max(train_sizes) + test_size_fixed`` $\\le 48.000 < 50.000$, contesto e
+    test restano nel regime supportato.
+
+    Args:
+        dataset_id: ID OpenML di gmsc (default 45577, ~150k righe binarie).
+        dataset_name: Nome leggibile per tabella e grafico.
+        train_sizes: Dimensioni crescenti del training set (default
+            ``[500, 1000, 2000, 5000, 10000, 20000, 40000]``).
+        test_size_fixed: Righe del test set fisso (default 8000).
+        lora_config: Configurazione LoRA (default ``r=8, alpha=16``, schema QV).
+        epochs, learning_rate, device, n_estimators_train, n_estimators_eval,
+        n_ctx_plus_query, eval_every, random_state: come negli altri esperimenti.
+        plot_path: Percorso del grafico PNG (None per non salvarlo).
+        csv_path: Percorso del CSV con la tabella (None per non salvarlo).
+        save_path: Se fornito, salva i pesi LoRA dell'ultima dimensione.
+        verbose: Se True, stampa avanzamento, tabella e conferme.
+
+    Returns:
+        Un ``pd.DataFrame`` con una riga per (train_size, modello) e colonne
+        ``train_size, model, auc_roc, f1, brier_score, ece``.
+    """
+    import os
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+    import pandas as pd
+    from sklearn.model_selection import train_test_split
+
+    from tabpfn import TabPFNClassifier
+    from tabpfn.constants import ModelVersion
+    from tabpfn.finetuning.train_util import clone_model_for_evaluation
+
+    try:
+        from utils.data_loader import load_dataset
+        from evaluation.metrics import evaluate_model
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("Root del progetto non nel sys.path.") from exc
+
+    if lora_config is None:
+        lora_config = LoRAConfig()  # default r=8, alpha=16, target q/v
+    if train_sizes is None:
+        train_sizes = [500, 1_000, 2_000, 5_000, 10_000, 20_000, 40_000]
+    train_sizes = sorted(set(int(s) for s in train_sizes))
+
+    # --- 0. Verifica di gmsc su OpenML -----------------------------------
+    if verbose:
+        try:
+            import openml
+            meta = openml.datasets.get_dataset(
+                dataset_id, download_data=False, download_qualities=True
+            )
+            q = meta.qualities or {}
+            print(
+                f"[VERIFICA OpenML] id={dataset_id} -> '{meta.name}': "
+                f"righe={q.get('NumberOfInstances')}, "
+                f"classi={q.get('NumberOfClasses')}, "
+                f"target='{meta.default_target_attribute}'"
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[VERIFICA OpenML] impossibile leggere i metadati: {exc}")
+
+    # --- 1. Carica e ritaglia il test set FISSO --------------------------
+    X, y = load_dataset(dataset_id)
+
+    # Vincolo del limite TabPFN (~50k): contesto + test entro il regime.
+    max_train = max(train_sizes)
+    if max_train + test_size_fixed > 50_000:
+        raise ValueError(
+            f"max(train_sizes)+test_size_fixed = {max_train}+{test_size_fixed} "
+            f"= {max_train + test_size_fixed} supera il limite di ~50.000 di "
+            f"TabPFN-2.5. Riduci train_sizes o test_size_fixed."
+        )
+    if max_train + test_size_fixed > len(y):
+        raise ValueError(
+            f"Il dataset ha solo {len(y)} righe: insufficiente per "
+            f"train={max_train} + test={test_size_fixed}."
+        )
+
+    X_pool, X_test, y_pool, y_test = train_test_split(
+        X, y, test_size=test_size_fixed, random_state=random_state, stratify=y
+    )
+    if verbose:
+        pos = float(np.mean(y_test))
+        print(
+            f"\nTest set FISSO: {len(y_test)} righe (pos={pos * 100:.1f}%), "
+            f"pool di training disponibile: {len(y_pool)} righe."
+        )
+
+    eval_args = {
+        "device": device,
+        "n_estimators": n_estimators_eval,
+        "random_state": random_state,
+        "ignore_pretraining_limits": True,
+    }
+
+    records: List[dict] = []
+    last_clf = None
+
+    # --- 2. Loop sulle dimensioni di training ----------------------------
+    for size in train_sizes:
+        if size > len(y_pool):
+            if verbose:
+                print(f"\n[skip] dimensione {size} > pool ({len(y_pool)}).")
+            continue
+
+        # Campionamento stratificato del training set dalla pool.
+        X_tr, _, y_tr, _ = train_test_split(
+            X_pool, y_pool, train_size=size,
+            random_state=random_state, stratify=y_pool,
+        )
+        if verbose:
+            print(f"\n########## train_size = {size} "
+                  f"(pos={np.mean(y_tr) * 100:.1f}%) ##########")
+
+        # --- base -------------------------------------------------------
+        base = TabPFNClassifier.create_default_for_version(
+            version=ModelVersion.V2_5,
+            device=device,
+            n_estimators=n_estimators_eval,
+            random_state=random_state,
+            ignore_pretraining_limits=True,
+        )
+        base.fit(X_tr, y_tr)
+        prob_base = base.predict_proba(X_test)[:, 1]
+        res_base = evaluate_model(y_test, prob_base, "TabPFN-base", dataset_name)
+        records.append({"train_size": size, "model": "TabPFN-base",
+                        **{k: res_base[k] for k in
+                           ("auc_roc", "f1", "brier_score", "ece")}})
+        del base
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # --- LoRA -------------------------------------------------------
+        clf, _ = create_lora_classifier(
+            lora_config, device=device,
+            n_estimators=n_estimators_train, random_state=random_state,
+        )
+        train_lora(
+            clf, X_tr, y_tr,
+            epochs=epochs, learning_rate=learning_rate, device=device,
+            n_ctx_plus_query=n_ctx_plus_query, eval_every=eval_every,
+            random_state=random_state, n_estimators_eval=n_estimators_train,
+            verbose=verbose,
+        )
+        lora_infer = clone_model_for_evaluation(clf, eval_args, TabPFNClassifier)
+        lora_infer.fit(X_tr, y_tr)
+        prob_lora = lora_infer.predict_proba(X_test)[:, 1]
+        res_lora = evaluate_model(y_test, prob_lora, "TabPFN-LoRA", dataset_name)
+        records.append({"train_size": size, "model": "TabPFN-LoRA",
+                        **{k: res_lora[k] for k in
+                           ("auc_roc", "f1", "brier_score", "ece")}})
+
+        last_clf = clf
+        del lora_infer
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    df = pd.DataFrame(records)
+
+    # --- 3. Tabella ------------------------------------------------------
+    if verbose and not df.empty:
+        print("\n" + "=" * 72)
+        print(f"ABLATION DIMENSIONE DATI (in-domain finanziario) -- {dataset_name}")
+        print("=" * 72)
+        print(f"{'train_size':>10} | {'model':<12} | {'AUC':>7} | {'F1':>7} | "
+              f"{'Brier':>7} | {'ECE':>7}")
+        print("-" * 72)
+        for size in sorted(df["train_size"].unique()):
+            for _, r in df[df["train_size"] == size].iterrows():
+                print(f"{r['train_size']:>10} | {r['model']:<12} | "
+                      f"{r['auc_roc']:>7.4f} | {r['f1']:>7.4f} | "
+                      f"{r['brier_score']:>7.4f} | {r['ece']:>7.4f}")
+            print("-" * 72)
+
+    # --- 4. Grafico AUC vs dimensione ------------------------------------
+    if plot_path is not None and not df.empty:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            base_df = df[df["model"] == "TabPFN-base"].sort_values("train_size")
+            lora_df = df[df["model"] == "TabPFN-LoRA"].sort_values("train_size")
+            plt.figure(figsize=(7, 4.5))
+            plt.plot(base_df["train_size"], base_df["auc_roc"],
+                     marker="o", linewidth=2, label="TabPFN base")
+            plt.plot(lora_df["train_size"], lora_df["auc_roc"],
+                     marker="s", linewidth=2, label="TabPFN + LoRA")
+            plt.xscale("log")
+            plt.xlabel("Dimensione del training set (scala log)")
+            plt.ylabel(f"AUC-ROC sul test fisso ({test_size_fixed} righe)")
+            plt.title(f"Ablation dimensione dati in-domain -- {dataset_name}")
+            plt.grid(True, which="both", linestyle=":", alpha=0.5)
+            plt.legend()
+            plt.tight_layout()
+            os.makedirs(os.path.dirname(os.path.abspath(plot_path)), exist_ok=True)
+            plt.savefig(plot_path, dpi=150)
+            plt.close()
+            if verbose:
+                print(f"\n[PLOT] Grafico salvato in '{plot_path}'.")
+        except ImportError:
+            print("[WARN] matplotlib non disponibile: grafico non generato.")
+
+    # --- 5. CSV e pesi ---------------------------------------------------
+    if csv_path is not None and not df.empty:
+        os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+        df.to_csv(csv_path, index=False)
+        if verbose:
+            print(f"[SAVE] Tabella salvata in '{csv_path}'.")
+    if save_path is not None and last_clf is not None:
+        save_lora_adapters(last_clf.model_, save_path)
+        if verbose:
+            print(f"Pesi LoRA (ultima dimensione) salvati in '{save_path}'")
+
+    return df
+
+
 def run_lora_ablation(
     configs: List[LoRAConfig],
     config_names: List[str],
@@ -1098,15 +1365,16 @@ def run_lora_ablation(
     """Ablation degli iperparametri LoRA: confronta piu' configurazioni.
 
     Per ciascuna ``LoRAConfig`` esegue :func:`run_lora_exp5` (training sui
-    dataset medici + valutazione su quelli di test) e raccoglie i risultati in
-    un'unica tabella, con il baseline (TabPFN senza LoRA) riportato una sola
-    volta. Serve a verificare se aumentando capacita'/target il LoRA cambia
-    qualcosa, oppure se TabPFN e' davvero al soffitto.
+    dataset finanziari + valutazione su quelli di test in-domain) e raccoglie i
+    risultati in un'unica tabella, con il baseline (TabPFN senza LoRA) riportato
+    una sola volta. Serve a verificare se aumentando capacita'/target il LoRA
+    cambia qualcosa, oppure se TabPFN e' davvero al soffitto. E' l'Esperimento 2
+    (ablation sulla capacita'), ora eseguito sui nuovi dataset finanziari.
 
     Args:
         configs: Lista di configurazioni LoRA da confrontare.
         config_names: Etichette brevi per ciascuna config (stessa lunghezza).
-        finetune_names: Dataset di training (default: tutti i medici).
+        finetune_names: Dataset di training (default: tutti i finanziari).
         eval_names: Dataset di valutazione (default: tutti i test).
         epochs, learning_rate, device, n_estimators_train, n_estimators_eval,
         random_state, verbose: come in :func:`run_lora_exp5`.

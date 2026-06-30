@@ -44,19 +44,31 @@ from sklearn.preprocessing import LabelEncoder, OrdinalEncoder
 # Costanti
 # ---------------------------------------------------------------------------
 
+# Dataset di FINE-TUNING (dominio FINANZIARIO/creditizio). Sostituiscono i
+# precedenti dataset medici, che erano troppo piccoli (155-768 righe) per
+# fornire abbastanza passi di gradiente. Tutti binari, di dimensione adeguata e
+# sotto il limite di ~50.000 righe di TabPFN-2.5. ID verificati su OpenML.
 FINETUNE_DATASETS: Dict[str, int] = {
-    "diabetes": 37,
-    "breast_cancer": 1510,
-    "heart_disease": 53,
-    "chronic_kidney": 42972,
-    "hepatitis": 55,
+    "bank_marketing": 1461,        # ~45.211 righe, 16 feat, 88/12
+    "default_credit": 42477,       # ~30.000 righe, 23 feat, 78/22
+    "polish_bankruptcy_2": 42984,  # ~10.173 righe, 64 feat, 96/4
+    "polish_bankruptcy_3": 42985,  # ~10.503 righe, 64 feat, 95/5
+    "polish_bankruptcy_4": 42986,  # ~9.792 righe,  64 feat, 95/5
 }
 
+# Dataset di VALUTAZIONE (stesso dominio FINANZIARIO -> valutazione IN-DOMAIN).
+# Mai usati in training. Il cambio rispetto alla configurazione cross-domain
+# (medico -> non medico) serve a rispondere correttamente alla domanda "il LoRA
+# specializza TabPFN su un settore specifico?". ID verificati su OpenML.
+#
+# NOTA: gli ID dei Polish bankruptcy forniti inizialmente (40474-40478) erano
+# ERRATI: puntavano a dataset 'thyroid' a 5 classi. Gli ID corretti dei
+# 'polish-bankruptcy-Nyear' sono 42880/42984/42985/42986/42987.
 EVALUATION_DATASETS: Dict[str, int] = {
-    "thyroid": 1000,
-    "adult": 1590,
-    "credit_g": 31,
-    "blood_transfusion": 1464,
+    "polish_bankruptcy_1": 42880,  # ~7.027 righe, 64 feat, 96/4
+    "polish_bankruptcy_5": 42987,  # ~5.910 righe, 64 feat, 93/7
+    "australian_credit": 40981,    # ~690 righe,   14 feat, 56/44
+    "credit_g": 31,                # ~1.000 righe, 20 feat, 70/30 (ora in-domain)
 }
 
 # Dataset usati per gli esperimenti della pipeline esterna (ensembling,
@@ -104,6 +116,31 @@ def _cache_path(dataset_id: int) -> str:
     return os.path.join(CACHE_DIR, f"dataset_{dataset_id}.pkl")
 
 
+def _print_dataset_verification(name: str, X: np.ndarray, y: np.ndarray) -> None:
+    """
+    Stampa una riga di verifica con nome, dimensioni e distribuzione del target.
+
+    Serve a controllare ``a vista`` che ogni dataset caricato corrisponda a
+    quanto atteso (numero di righe/feature plausibile, target binario con
+    proporzioni sensate). E' un presidio contro gli ID OpenML errati, problema
+    gia' occorso nel progetto.
+
+    Formato: ``Dataset <nome>: <righe> righe, <feature> feature,
+    target distribution: <c0>% / <c1>%``.
+    """
+    n = len(y)
+    if n == 0:
+        print(f"[VERIFICA] Dataset {name}: 0 righe (vuoto!)")
+        return
+    counts = np.bincount(y.astype(int))
+    dist = " / ".join(f"{c / n * 100:.1f}%" for c in counts)
+    flag = "" if len(counts) == 2 else f"  [ATTENZIONE: {len(counts)} classi]"
+    print(
+        f"[VERIFICA] Dataset {name}: {X.shape[0]} righe, {X.shape[1]} feature, "
+        f"target distribution: {dist}{flag}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. load_dataset
 # ---------------------------------------------------------------------------
@@ -145,6 +182,7 @@ def load_dataset(dataset_id: int) -> Tuple[np.ndarray, np.ndarray]:
                 f"[CACHE] Dataset '{name}' caricato dalla cache | "
                 f"campioni: {X.shape[0]} | feature: {X.shape[1]}"
             )
+            _print_dataset_verification(name, X, y)
             return X, y
         except (pickle.PickleError, KeyError, EOFError) as exc:
             print(
@@ -280,6 +318,7 @@ def load_dataset(dataset_id: int) -> Tuple[np.ndarray, np.ndarray]:
         f"[OPENML] Dataset '{name}' scaricato | "
         f"campioni: {X.shape[0]} | feature: {X.shape[1]}"
     )
+    _print_dataset_verification(name, X, y)
 
     try:
         with open(cache_file, "wb") as fh:

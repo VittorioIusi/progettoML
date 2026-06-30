@@ -1,0 +1,273 @@
+%==============================================================================
+%  Slide di presentazione (Beamer) -- esame di Machine Learning
+%  Compilare con: pdflatex presentazione.tex  (due volte)
+%  Durata stimata: 8-10 minuti (~11 slide + backup)
+%==============================================================================
+\documentclass[11pt,aspectratio=169]{beamer}
+
+\usetheme{Madrid}
+\usecolortheme{dolphin}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath,amssymb}
+\beamertemplatenavigationsymbolsempty
+\setbeamertemplate{caption}{\raggedright\insertcaption\par}
+
+\title[TabPFN + LoRA \& pipeline]{Migliorare TabPFN-2.5 su classificazione binaria}
+\subtitle{Adattamento interno (LoRA) e pipeline esterna}
+\author{Progetto di Machine Learning}
+\date{\today}
+
+\begin{document}
+
+\frame{\titlepage}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Il problema}
+\begin{block}{Domanda di ricerca}
+Si può \textbf{migliorare TabPFN-2.5} su classificazione binaria
+\textbf{senza riaddestrarne i pesi}?
+\end{block}
+\vfill
+\textbf{TabPFN} = \emph{foundation model} per dati tabulari:
+\begin{itemize}
+  \item impara \emph{in-context} (riceve il training set come contesto, nessun
+  training a tempo di uso);
+  \item pesi pre-addestrati una volta su milioni di dataset sintetici;
+  \item versione 2.5, fino a $\sim$$50\,000$ campioni.
+\end{itemize}
+\vfill
+\centering
+\alert{Due strade complementari: modificare il modello vs.\ lavorare sull'output.}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{La struttura del lavoro}
+\begin{columns}[T]
+\begin{column}{0.5\textwidth}
+\begin{block}{Cap. 1 -- Adattamento \emph{interno}}
+\textbf{LoRA fine-tuning}: adapter a basso rango iniettati nell'attenzione.
+\[
+ y = Wx + \tfrac{\alpha}{r}\,BA\,x
+\]
+Si addestra solo $A,B$ ($\sim$$2.7\%$ dei parametri); $W$ congelato.
+\end{block}
+\end{column}
+\begin{column}{0.5\textwidth}
+\begin{block}{Cap. 2 -- Pipeline \emph{esterna}}
+Pesi \textbf{congelati}, si agisce sull'\textbf{output}:
+\begin{itemize}
+  \item ensembling
+  \item calibrazione (Platt / Isotonic)
+  \item ottimizzazione della soglia
+\end{itemize}
+\end{block}
+\end{column}
+\end{columns}
+\vfill
+\centering\small
+Implementazione completa: \texttt{data\_loader}, \texttt{metrics},
+\texttt{lora}, \texttt{tabpfn\_lora}, \texttt{external\_pipeline}.
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Setup sperimentale}
+\begin{itemize}
+  \item \textbf{Dataset}: 11 dataset binari OpenML (5 medici per il fine-tuning,
+  4 di test, 2 grandi per la pipeline). \emph{Corretti 2 ID errati nello spec.}
+  \item \textbf{Metriche}: AUC-ROC, F1 macro (discriminazione); Brier, ECE
+  (calibrazione).
+  \item \textbf{Rigore}:
+  \begin{itemize}
+    \item split stratificato \textbf{anti-leakage} (3 vie: context / calibration / test);
+    \item \textbf{early stopping} su validazione interna;
+    \item pipeline ripetuta su \textbf{5 semi} $\to$ media $\pm$ deviazione standard.
+  \end{itemize}
+\end{itemize}
+\vfill
+\centering
+\alert{Niente conclusioni da un singolo split fortunato.}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Cap. 1 -- LoRA: tre esperimenti}
+Ipotesi: il LoRA migliora TabPFN. La testiamo ed escludiamo le alternative.
+\vfill
+\begin{table}
+\centering\small
+\begin{tabular}{lll}
+\toprule
+Ipotesi & Esperimento & Esito \\
+\midrule
+Generalizza fuori dominio & medici $\to$ test & LoRA $\approx$ base \\
+Manca \textbf{capacità}?   & ablation $4\times$ param. & nessun cambiamento \\
+Mancano \textbf{dati}?     & ablation $60\times$ dati  & nessun gain; over-train degrada \\
+\bottomrule
+\end{tabular}
+\end{table}
+\vfill
+\begin{itemize}
+  \item Differenze sempre entro la 3ª--4ª cifra decimale.
+  \item Dinamica chiave: la val-AUC \textbf{decresce} dopo l'epoca 5
+  $\Rightarrow$ allenare di più \emph{peggiora}.
+\end{itemize}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Cap. 1 -- Conclusione}
+\begin{block}{}
+Il LoRA \textbf{non migliora} la discriminazione di TabPFN-2.5, e \textbf{non}
+è un problema né di capacità né di dati.
+\end{block}
+\vfill
+\centering
+I pesi pre-addestrati sono \alert{già vicini all'ottimo}.\\[4pt]
+L'adattamento è \emph{non distruttivo} (robusto allo shift di dominio).\\[4pt]
+Unico segnale debole: la \textbf{calibrazione} (ECE).
+\vfill
+\flushright\small$\Rightarrow$ ci dice dove cercare nel Cap. 2: il post-processing.
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Cap. 2 -- Quale intervento muove quale metrica}
+\begin{table}
+\centering\small
+\begin{tabular}{lcccc}
+\toprule
+Intervento & AUC & F1 & Brier & ECE \\
+\midrule
+Ensembling            & \checkmark & (\checkmark) & -- & -- \\
+Calibrazione          & $=$ & $=$ & \checkmark & \checkmark \\
+Ottimizzazione soglia & $=$ & \checkmark & $=$ & $=$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+\vfill
+\begin{itemize}
+  \item Ogni intervento agisce su un \textbf{asse distinto}: non sono ridondanti.
+  \item Una trasformazione \emph{monotona} (calibrazione) non tocca il ranking
+  $\Rightarrow$ AUC invariata \emph{per costruzione}.
+\end{itemize}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Cap. 2 -- Ensembling e calibrazione: nessun gain}
+\begin{columns}[T]
+\begin{column}{0.5\textwidth}
+\textbf{Ensembling}
+\begin{itemize}\small
+  \item self-ensemble: $\Delta$AUC $\pm0.003$, \emph{dentro} la std.
+  \item TabPFN ensembla già internamente.
+  \item TabPFN+GBM: \emph{peggiora} (media verso il modello debole).
+\end{itemize}
+\end{column}
+\begin{column}{0.5\textwidth}
+\textbf{Calibrazione}
+\begin{itemize}\small
+  \item ECE \emph{base} già bassissimo ($0.006$--$0.02$).
+  \item Platt \alert{peggiora} l'ECE.
+  \item Isotonic: margini minimi, abbassa un filo l'AUC.
+\end{itemize}
+\end{column}
+\end{columns}
+\vfill
+\centering
+\alert{TabPFN è near-optimal anche in varianza e calibrazione.}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Cap. 2 -- Il risultato POSITIVO: la soglia}
+L'ottimizzazione della soglia migliora l'F1 \textbf{lasciando AUC/Brier/ECE invariati}.
+\vfill
+\begin{table}
+\centering\small
+\begin{tabular}{lccc}
+\toprule
+Dataset & F1 (soglia 0.5) & F1 (soglia ott.) & $\Delta$ \\
+\midrule
+\texttt{credit\_g}      & 0.657 & \textbf{0.710} & $+5.3$ \\
+\texttt{bank\_marketing}& 0.742 & \textbf{0.784} & $+4.2$ \\
+\texttt{blood\_transf.} & 0.644 & \textbf{0.678} & $+3.4$ \\
+\texttt{adult}          & 0.798 & 0.804 & $+0.6$ \\
+\midrule
+bilanciati / saturi     & \multicolumn{3}{c}{$\approx 0$ (la soglia 0.5 è già ottimale)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+\vfill
+\centering
+Il guadagno \alert{scala con lo sbilanciamento}. Costo: nullo.
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{La tesi unificante}
+\begin{block}{Cinque esperimenti, una conclusione}
+TabPFN-2.5 è \textbf{vicino all'ottimo} non solo nella discriminazione, ma anche
+nella \textbf{calibrazione} e nella \textbf{varianza} delle stime.
+\end{block}
+\vfill
+\begin{itemize}
+  \item LoRA, ensembling, ricalibrazione $\Rightarrow$ \textbf{nessun valore aggiunto}.
+  \item Il margine residuo non è nel modello né nelle probabilità, ma nella
+  \textbf{regola di decisione}.
+\end{itemize}
+\vfill
+\centering
+\alert{L'unico ``pasto gratis'': scegliere la soglia in base a metrica e
+sbilanciamento.}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Conclusioni e limiti}
+\textbf{Contributi}
+\begin{itemize}
+  \item Pipeline completa e riproducibile (LoRA da zero + post-processing).
+  \item Null result \emph{rigoroso} sull'adattamento (ipotesi escluse a una a una).
+  \item Risultato pratico: $+4$--$5$ punti F1 via soglia sugli sbilanciati.
+\end{itemize}
+\vfill
+\textbf{Limiti (dichiarati)}
+\begin{itemize}
+  \item Esplorati $r \le 16$, lr fisso; pipeline su CPU con dataset limitati a $8$k.
+  \item Solo classificazione binaria; calibratori semplici (Platt/Isotonic).
+\end{itemize}
+\vfill
+\centering\small
+\emph{``Un'indagine sui limiti dell'adattamento di un foundation model tabulare maturo.''}
+\end{frame}
+
+%------------------------------------------------------------------------------
+\begin{frame}{Grazie}
+\centering
+\Large Domande?
+\vfill
+\normalsize
+Codice e relazione completa nel repository del progetto.
+\end{frame}
+
+%------------------------------------------------------------------------------
+% BACKUP -- domande attese
+%------------------------------------------------------------------------------
+\begin{frame}{Backup -- domande attese}
+\small
+\begin{itemize}
+  \item \textbf{``Quindi non hai migliorato il modello?''} \\
+  Ho dimostrato \emph{perché} non si può con queste tecniche (è il contributo) e
+  ho comunque un gain pratico sulla soglia.
+  \item \textbf{``Perché Platt peggiora l'ECE?''} \\
+  Impone una sigmoide a probabilità già ben calibrate: aggiunge distorsione dove
+  non serve, e su pochi dati di calibrazione è instabile.
+  \item \textbf{``Perché l'ensembling non aiuta?''} \\
+  TabPFN media già più permutazioni internamente: la varianza residua è bassa.
+  \item \textbf{``Isotonic non abbassa l'AUC?''} \\
+  In teoria è monotona, ma i suoi ``gradini'' creano pareggi nel ranking: lieve
+  calo di AUC su dati piccoli.
+  \item \textbf{``Generalizzabilità?''} \\
+  6 dataset, 5 semi, std riportate; due dataset grandi per stime stabili di ECE.
+\end{itemize}
+\end{frame}
+
+\end{document}

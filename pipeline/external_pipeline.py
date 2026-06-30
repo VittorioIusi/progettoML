@@ -354,6 +354,7 @@ def run_ensemble_experiment(
     calib_size: float = 0.25,
     test_size: float = 0.25,
     max_samples: int = 20000,
+    n_estimators: int = 4,
     device: str = "cuda",
     save_path: Optional[str] = None,
     verbose: bool = True,
@@ -407,7 +408,7 @@ def run_ensemble_experiment(
                 print(f"  [seed {seed}] train={len(y_tr)} test={len(y_te)}")
 
             # --- base: singola istanza TabPFN ----------------------------
-            clf0 = _make_tabpfn(device, random_state=seed, n_estimators=4)
+            clf0 = _make_tabpfn(device, random_state=seed, n_estimators=n_estimators)
             clf0.fit(X_tr, y_tr)
             prob_base = clf0.predict_proba(X_te)[:, 1]
             records.append({
@@ -420,7 +421,9 @@ def run_ensemble_experiment(
             # --- self-ensemble: media di n_ensemble istanze TabPFN -------
             probas = [prob_base]  # riusa la prima per non sprecare calcolo
             for j in range(1, n_ensemble):
-                clf = _make_tabpfn(device, random_state=seed * 100 + j, n_estimators=4)
+                clf = _make_tabpfn(
+                    device, random_state=seed * 100 + j, n_estimators=n_estimators
+                )
                 clf.fit(X_tr, y_tr)
                 probas.append(clf.predict_proba(X_te)[:, 1])
             prob_self = average_probas(probas)
@@ -465,6 +468,7 @@ def run_calibration_threshold_experiment(
     calib_size: float = 0.25,
     test_size: float = 0.25,
     max_samples: int = 20000,
+    n_estimators: int = 4,
     device: str = "cuda",
     save_path: Optional[str] = None,
     verbose: bool = True,
@@ -516,7 +520,7 @@ def run_calibration_threshold_experiment(
                 print(f"  [seed {seed}] train={len(y_tr)} "
                       f"calib={len(y_ca)} test={len(y_te)}")
 
-            clf = _make_tabpfn(device, random_state=seed, n_estimators=4)
+            clf = _make_tabpfn(device, random_state=seed, n_estimators=n_estimators)
             clf.fit(X_tr, y_tr)
             prob_ca = clf.predict_proba(X_ca)[:, 1]
             prob_te = clf.predict_proba(X_te)[:, 1]

@@ -1,0 +1,312 @@
+%==============================================================================
+%  Capitolo "Pipeline esterna" -- frammento da \input nella relazione completa.
+%  NON compila da solo: presuppone il preambolo di relazione_lora.tex
+%  (booktabs, multirow, amsmath, listings, enumitem, ...).
+%
+%  STATO: struttura e metodologia complete; le tabelle dei risultati contengono
+%  segnaposto "??" da sostituire con i numeri di:
+%    - results/exp4_calib_threshold.csv  (Esp. 4)
+%    - results/exp3_ensemble.csv         (Esp. 3)
+%==============================================================================
+
+%==============================================================================
+\section{Pipeline esterna: ensembling, calibrazione e soglia}
+\label{sec:pipeline}
+%==============================================================================
+
+\subsection{Motivazione e approccio}
+Il capitolo precedente ha stabilito che il fine-tuning a basso rango non
+migliora la capacità discriminativa di TabPFN-2.5: i pesi pre-addestrati sono
+già vicini all'ottimo e l'unico segnale ricorrente -- per quanto modesto -- è
+sul versante della \emph{calibrazione}. Questa osservazione indirizza la
+seconda parte del lavoro: invece di modificare il modello, lo si tratta come un
+predittore \textbf{congelato} e si interviene unicamente sul suo
+\textbf{output} (le probabilità della classe positiva). È l'approccio speculare
+al LoRA: il valore aggiunto va cercato \emph{attorno} al modello, su assi che
+l'adattamento dei pesi non può raggiungere.
+
+Vengono studiati due blocchi, ciascuno mirato a un diverso asse della qualità
+predittiva:
+\begin{itemize}[nosep]
+  \item \textbf{Ensembling} (Esp.~4): combinare più predizioni per ridurre la
+  varianza della stima, con l'obiettivo di migliorare la discriminazione
+  (AUC-ROC);
+  \item \textbf{Calibrazione e ottimizzazione della soglia} (Esp.~5):
+  post-processare le probabilità per migliorarne l'affidabilità (ECE, Brier) e
+  scegliere il \emph{cutoff} decisionale ottimale per l'F1 macro.
+\end{itemize}
+
+\paragraph{Quale intervento muove quale metrica.} I due blocchi sono
+complementari e non ridondanti: ciascuno agisce su un asse distinto, come
+riassunto nella Tabella~\ref{tab:chimuovecosa}. Questa separazione è la chiave
+di lettura dei risultati: un ensembling che riordina i campioni può spostare
+l'AUC; una trasformazione monotona delle probabilità (calibrazione) ne migliora
+l'affidabilità senza toccarne l'ordinamento, quindi lascia l'AUC invariata; la
+sola scelta della soglia agisce esclusivamente sull'F1.
+
+\begin{table}[h]
+\centering
+\caption{Asse di azione atteso di ciascun intervento. ``='' indica invarianza
+attesa per costruzione (es.\ una trasformazione monotona non altera l'AUC).}
+\label{tab:chimuovecosa}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Intervento & AUC-ROC & F1 & Brier & ECE \\
+\midrule
+Ensembling (Esp.~4)            & \checkmark & (\checkmark) & --         & --         \\
+Calibrazione (Esp.~5a)         & $=$        & $=$          & \checkmark & \checkmark \\
+Ottimizzazione soglia (Esp.~5b)& $=$        & \checkmark   & $=$        & $=$        \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metodologia sperimentale}
+\label{sec:pipeline-metodo}
+
+\paragraph{Dataset.} Gli esperimenti riprendono i quattro dataset di
+valutazione del capitolo LoRA (\texttt{thyroid}, \texttt{adult},
+\texttt{credit\_g}, \texttt{blood\_transfusion}), così da consentire un
+confronto diretto, e vi aggiungono due dataset binari di grandi dimensioni --
+\texttt{bank\_marketing} (OpenML~1461, $45\,211$ righe) e
+\texttt{magic\_telescope} (OpenML~1120, $19\,020$ righe). La ragione è
+metodologica: le metriche di calibrazione (in particolare l'ECE, basato su 10
+bin) sono rumorose su insiemi di test piccoli; i due dataset \texttt{credit\_g}
+($1\,000$) e \texttt{blood\_transfusion} ($748$) sono troppo ridotti perché le
+conclusioni su calibrazione e soglia siano robuste se prese isolatamente, mentre
+i dataset grandi forniscono insiemi di test ampi e stime stabili.
+
+\paragraph{Split a tre vie e assenza di leakage.} Per ciascun dataset si adotta
+una suddivisione stratificata in tre parti: \emph{train/context}
+($50\%$), su cui TabPFN esegue l'in-context learning; \emph{calibration}
+($25\%$), su cui si stimano il calibratore e la soglia ottimale; e \emph{test}
+($25\%$), su cui si misurano tutte le metriche. Calibratore e soglia sono
+fittati \emph{esclusivamente} sul set di calibrazione, mai sul test: è lo stesso
+principio anti-leakage dell'early stopping del capitolo precedente. I dataset
+più grandi sono campionati fino a un massimo prefissato per contenere i tempi di
+inferenza su CPU, mantenendo comunque insiemi di test ampi.
+
+\paragraph{Ripetizioni e riproducibilità.} L'intera procedura (split, fit,
+valutazione) è ripetuta su $5$ semi indipendenti. I risultati sono riportati come
+media $\pm$ deviazione standard sulle ripetizioni: ciò quantifica esplicitamente
+il rumore, rilevante soprattutto sui dataset piccoli, ed evita di trarre
+conclusioni da un singolo split fortunato.
+
+\subsection{Esperimento 4: ensembling}
+\label{sec:exp-ensemble}
+Si confrontano tre strategie, tutte a pesi congelati:
+\begin{itemize}[nosep]
+  \item \texttt{base}: una singola istanza di TabPFN (riferimento);
+  \item \texttt{self\_ensemble}: media delle probabilità di $5$ istanze di
+  TabPFN con semi interni diversi (diverse permutazioni/preprocessing). Misura il
+  guadagno ottenibile dalla sola riduzione della varianza interna del modello,
+  senza ricorrere ad altri modelli;
+  \item \texttt{tabpfn+gbm}: media tra TabPFN e un \texttt{GradientBoosting}
+  addestrato sullo stesso contesto (ensemble eterogeneo).
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 4 -- ensembling. Media (deviazione standard) su $3$ semi.
+In \textbf{grassetto} la migliore AUC-ROC per dataset (metrica bersaglio).
+$\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:ensemble}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Metodo & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{3}{*}{\texttt{credit\_g}}
+ & base          & \textbf{0.793 (0.046)} & 0.644 (0.024) & 0.163 (0.014) & 0.061 (0.011) \\
+ & self\_ensemble& \textbf{0.793 (0.043)} & 0.660 (0.031) & 0.163 (0.013) & 0.058 (0.003) \\
+ & tabpfn+gbm    & 0.790 (0.061) & 0.670 (0.055) & 0.162 (0.020) & 0.060 (0.004) \\
+\addlinespace
+\multirow{3}{*}{\texttt{blood\_transfusion}}
+ & base          & \textbf{0.783 (0.034)} & 0.653 (0.018) & 0.144 (0.012) & 0.052 (0.009) \\
+ & self\_ensemble& 0.782 (0.035) & 0.653 (0.011) & 0.144 (0.012) & 0.056 (0.004) \\
+ & tabpfn+gbm    & 0.768 (0.033) & 0.658 (0.029) & 0.150 (0.014) & 0.052 (0.023) \\
+\addlinespace
+\multirow{3}{*}{\texttt{thyroid}}
+ & base          & 0.999 (0.001) & 0.980 (0.008) & 0.005 (0.001) & 0.005 (0.000) \\
+ & self\_ensemble& 0.999 (0.001) & 0.979 (0.012) & 0.005 (0.002) & 0.006 (0.000) \\
+ & tabpfn+gbm    & \textbf{0.999 (0.001)} & 0.986 (0.002) & 0.004 (0.001) & 0.004 (0.001) \\
+\addlinespace
+\multirow{3}{*}{\texttt{adult}}
+ & base          & 0.913 (0.006) & 0.795 (0.012) & 0.098 (0.003) & 0.020 (0.005) \\
+ & self\_ensemble& 0.913 (0.006) & 0.792 (0.011) & 0.098 (0.003) & 0.018 (0.006) \\
+ & tabpfn+gbm    & \textbf{0.915 (0.008)} & 0.795 (0.004) & 0.096 (0.004) & 0.019 (0.005) \\
+\addlinespace
+\multirow{3}{*}{\texttt{bank\_marketing}}
+ & base          & 0.933 (0.006) & 0.740 (0.018) & 0.063 (0.004) & 0.019 (0.004) \\
+ & self\_ensemble& \textbf{0.936 (0.006)} & 0.747 (0.014) & 0.062 (0.004) & 0.013 (0.002) \\
+ & tabpfn+gbm    & 0.929 (0.007) & 0.725 (0.017) & 0.065 (0.004) & 0.021 (0.002) \\
+\addlinespace
+\multirow{3}{*}{\texttt{magic\_telescope}}
+ & base          & 0.943 (0.004) & 0.876 (0.006) & 0.082 (0.004) & 0.014 (0.005) \\
+ & self\_ensemble& \textbf{0.944 (0.004)} & 0.877 (0.004) & 0.081 (0.004) & 0.016 (0.005) \\
+ & tabpfn+gbm    & 0.940 (0.003) & 0.872 (0.009) & 0.085 (0.003) & 0.030 (0.005) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+I risultati (Tabella~\ref{tab:ensemble}) indicano che \textbf{l'ensembling non
+migliora la discriminazione} di TabPFN-2.5.
+
+\paragraph{Self-ensemble: nessun guadagno oltre il rumore.} Mediare le
+probabilità di cinque istanze di TabPFN produce variazioni di AUC dell'ordine di
+$\pm 0{,}003$, sistematicamente \emph{interne} alla deviazione standard fra i
+semi (che va da $0{,}004$ a $0{,}046$): il più ampio, su \texttt{bank\_marketing}
+($0{,}933 \to 0{,}936$), resta entro un errore standard. Il motivo è strutturale:
+TabPFN esegue già internamente un ensemble su più permutazioni del contesto
+(parametro \texttt{n\_estimators}), quindi la varianza residua del singolo
+modello è bassa e mediare ulteriori copie non aggiunge informazione. Si osserva
+al più un lieve effetto di \emph{smoothing} sull'ECE in un paio di casi
+(\texttt{bank\_marketing} $0{,}019 \to 0{,}013$), comunque modesto.
+
+\paragraph{Ensemble eterogeneo: tendenzialmente controproducente.} Mediare
+TabPFN con un \texttt{GradientBoosting} \emph{abbassa} l'AUC nella maggioranza
+dei dataset (\texttt{blood\_transfusion} $0{,}783 \to 0{,}768$,
+\texttt{magic\_telescope} $0{,}943 \to 0{,}940$, \texttt{bank\_marketing}
+$0{,}933 \to 0{,}929$): essendo il GBM mediamente più debole di TabPFN su questi
+problemi, la media viene trascinata verso il modello peggiore. L'unica eccezione
+è \texttt{thyroid}, dove il GBM è competitivo e il mix ottiene il miglior F1
+($0{,}986$); su \texttt{adult} il vantaggio di AUC ($+0{,}002$) è marginale.
+In assenza di un peso adattivo o di un modello esterno almeno pari a TabPFN,
+l'ensemble eterogeneo non è una strategia affidabile.
+
+\subsection{Esperimento 5: calibrazione e ottimizzazione della soglia}
+\label{sec:exp-calib}
+A partire dalle probabilità grezze di TabPFN si confrontano quattro varianti:
+\begin{itemize}[nosep]
+  \item \texttt{base}: probabilità grezze, soglia $0{,}5$ (riferimento);
+  \item \texttt{platt}: calibrazione con \emph{Platt scaling} (regressione
+  logistica a una variabile sulle probabilità di calibrazione);
+  \item \texttt{isotonic}: calibrazione con \emph{regressione isotonica}
+  (mappatura monotona non parametrica, più flessibile ma più avida di dati);
+  \item \texttt{threshold}: probabilità grezze ma con soglia scelta per
+  massimizzare l'F1 macro sul set di calibrazione.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 5 -- calibrazione e soglia. Media (deviazione standard)
+su $5$ semi. In \textbf{grassetto} il miglior F1 e il miglior ECE per dataset.
+$\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:calib}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Metodo & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{4}{*}{\texttt{credit\_g}}
+ & base      & 0.801 (0.034) & 0.657 (0.025) & 0.161 (0.010) & 0.061 (0.011) \\
+ & platt     & 0.801 (0.034) & 0.618 (0.019) & 0.167 (0.006) & 0.084 (0.021) \\
+ & isotonic  & 0.789 (0.033) & 0.681 (0.044) & 0.166 (0.016) & \textbf{0.059 (0.037)} \\
+ & threshold & 0.801 (0.034) & \textbf{0.710 (0.035)} & 0.161 (0.010) & 0.061 (0.011) \\
+\addlinespace
+\multirow{4}{*}{\texttt{blood\_transfusion}}
+ & base      & 0.743 (0.066) & 0.644 (0.019) & 0.153 (0.017) & 0.073 (0.031) \\
+ & platt     & 0.743 (0.066) & 0.451 (0.033) & 0.160 (0.005) & 0.073 (0.020) \\
+ & isotonic  & 0.733 (0.061) & 0.606 (0.091) & 0.156 (0.011) & \textbf{0.057 (0.024)} \\
+ & threshold & 0.743 (0.066) & \textbf{0.678 (0.036)} & 0.153 (0.017) & 0.073 (0.031) \\
+\addlinespace
+\multirow{4}{*}{\texttt{thyroid}}
+ & base      & 0.999 (0.001) & 0.977 (0.008) & 0.005 (0.001) & 0.006 (0.001) \\
+ & platt     & 0.999 (0.001) & 0.977 (0.006) & 0.006 (0.001) & 0.017 (0.003) \\
+ & isotonic  & 0.992 (0.008) & 0.978 (0.007) & 0.006 (0.001) & \textbf{0.005 (0.001)} \\
+ & threshold & 0.999 (0.001) & \textbf{0.978 (0.008)} & 0.005 (0.001) & 0.006 (0.001) \\
+\addlinespace
+\multirow{4}{*}{\texttt{adult}}
+ & base      & 0.917 (0.007) & 0.798 (0.011) & 0.096 (0.004) & 0.019 (0.004) \\
+ & platt     & 0.917 (0.007) & 0.791 (0.011) & 0.098 (0.004) & 0.046 (0.003) \\
+ & isotonic  & 0.915 (0.007) & 0.790 (0.021) & 0.097 (0.004) & \textbf{0.019 (0.009)} \\
+ & threshold & 0.917 (0.007) & \textbf{0.804 (0.010)} & 0.096 (0.004) & 0.019 (0.004) \\
+\addlinespace
+\multirow{4}{*}{\texttt{bank\_marketing}}
+ & base      & 0.931 (0.005) & 0.742 (0.015) & 0.063 (0.003) & 0.019 (0.003) \\
+ & platt     & 0.931 (0.005) & 0.732 (0.019) & 0.067 (0.003) & 0.034 (0.004) \\
+ & isotonic  & 0.929 (0.006) & 0.739 (0.030) & 0.064 (0.003) & \textbf{0.015 (0.006)} \\
+ & threshold & 0.931 (0.005) & \textbf{0.784 (0.006)} & 0.063 (0.003) & 0.019 (0.003) \\
+\addlinespace
+\multirow{4}{*}{\texttt{magic\_telescope}}
+ & base      & 0.944 (0.005) & 0.877 (0.004) & 0.081 (0.004) & \textbf{0.014 (0.003)} \\
+ & platt     & 0.944 (0.005) & \textbf{0.878 (0.005)} & 0.083 (0.004) & 0.029 (0.006) \\
+ & isotonic  & 0.943 (0.005) & 0.877 (0.005) & 0.081 (0.003) & 0.018 (0.005) \\
+ & threshold & 0.944 (0.005) & 0.877 (0.004) & 0.081 (0.004) & \textbf{0.014 (0.003)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+I risultati (Tabella~\ref{tab:calib}) raccontano una storia netta, in parte
+diversa dalle attese.
+
+\paragraph{La soglia è il guadagno reale, concentrato sugli sbilanciati.}
+L'ottimizzazione della soglia migliora l'F1 macro su tutti e sei i dataset
+lasciando \emph{esattamente} invariate AUC, Brier ed ECE -- come previsto dalla
+Tabella~\ref{tab:chimuovecosa}, poiché agisce solo sulla regola di decisione e
+non sulle probabilità. L'entità del guadagno scala con lo sbilanciamento: è
+sostanziale su \texttt{credit\_g} ($F1: 0{,}657 \to 0{,}710$, $+5{,}3$ punti) e
+\texttt{bank\_marketing} ($0{,}742 \to 0{,}784$, $+4{,}2$ punti, classe
+positiva al $12\%$), apprezzabile su \texttt{blood\_transfusion}
+($0{,}644 \to 0{,}678$) e \texttt{adult} ($0{,}798 \to 0{,}804$), e nullo sui
+dataset bilanciati o saturi (\texttt{magic\_telescope}, \texttt{thyroid}), dove
+la soglia $0{,}5$ è già ottimale. È il risultato positivo più chiaro e robusto
+dell'intero progetto: un intervento a costo nullo che corregge il \emph{cutoff}
+decisionale là dove l'asimmetria di classe rende l'F1 a soglia fissa
+sub-ottimale.
+
+\paragraph{La calibrazione non aiuta, perché TabPFN è già ben calibrato.}
+Il dato più informativo è l'ECE del modello \texttt{base}: $0{,}019$ su
+\texttt{adult} e \texttt{bank\_marketing}, $0{,}014$ su \texttt{magic\_telescope},
+$0{,}006$ su \texttt{thyroid}. Sono valori già molto bassi: le probabilità di
+TabPFN sono affidabili \emph{senza} alcun post-processing. Di conseguenza la
+ricalibrazione ha poco margine e, anzi, tende a peggiorare: il \textbf{Platt
+scaling} aumenta l'ECE quasi ovunque (es.\ \texttt{adult} $0{,}019 \to 0{,}046$,
+\texttt{thyroid} $0{,}006 \to 0{,}017$) perché impone una sigmoide a
+probabilità che già non ne hanno bisogno, e sui dataset piccoli ne distorce
+gravemente l'F1 (\texttt{blood\_transfusion} $0{,}644 \to 0{,}451$). La
+\textbf{regressione isotonica} è più prudente e ottiene il miglior ECE in
+cinque dataset su sei, ma con margini minimi (es.\ \texttt{bank\_marketing}
+$0{,}019 \to 0{,}015$) e al prezzo di un lieve calo di AUC, dovuto ai
+\emph{gradini} della mappatura che introducono pareggi nel \emph{ranking}
+(\texttt{thyroid} $0{,}999 \to 0{,}992$). Nessuno dei due giustifica
+l'adozione come passo standard.
+
+\paragraph{Sintesi.} Degli interventi di post-processing, solo
+l'ottimizzazione della soglia produce un beneficio consistente, e unicamente
+sull'F1 dei dataset sbilanciati. La calibrazione è superflua perché il modello
+è già calibrato: un risultato che \emph{estende} la conclusione del capitolo
+LoRA -- dove l'unico segnale era proprio sull'ECE -- mostrando che quel margine,
+misurato qui rigorosamente, è in realtà trascurabile.
+
+\subsection{Discussione del capitolo}
+\label{sec:pipeline-discussione}
+I due esperimenti convergono con il capitolo precedente verso un'unica tesi
+coerente. Degli interventi esterni considerati -- che agiscono sull'output senza
+toccare i pesi -- due su tre \emph{non} producono alcun miglioramento robusto:
+\begin{itemize}[nosep]
+  \item l'\textbf{ensembling} non migliora l'AUC, perché la varianza del
+  singolo modello è già bassa (TabPFN ensembla internamente) e mediare con un
+  modello esterno più debole è dannoso (Sez.~\ref{sec:exp-ensemble});
+  \item la \textbf{calibrazione} non migliora l'ECE, perché le probabilità di
+  TabPFN sono già affidabili: il Platt scaling le peggiora e la regressione
+  isotonica le ritocca solo marginalmente (Sez.~\ref{sec:exp-calib}).
+\end{itemize}
+L'unico intervento con un effetto reale e prevedibile è l'\textbf{ottimizzazione
+della soglia} per l'F1 macro, efficace là dove lo sbilanciamento di classe rende
+sub-ottimale il \emph{cutoff} di default ($+4$--$5$ punti di F1 su
+\texttt{bank\_marketing} e \texttt{credit\_g}). È significativo che si tratti
+dell'unico intervento che non modifica né i pesi né le probabilità, ma soltanto
+la \emph{regola di decisione} che le traduce in classi.
+
+Letta insieme al capitolo sul LoRA, l'evidenza complessiva è netta: TabPFN-2.5
+è vicino all'ottimo non solo nella capacità discriminativa, ma anche nella
+\emph{calibrazione} e nella \emph{varianza} delle sue stime. Né l'adattamento dei
+pesi (LoRA), né l'ensembling, né la ricalibrazione aggiungono valore; il debole
+segnale sull'ECE intravisto nel fine-tuning, qui misurato con ripetizioni e
+deviazioni standard, si rivela trascurabile. Il margine di miglioramento residuo
+non è nel modello né nelle probabilità, ma nella decisione finale: scegliere la
+soglia in funzione della metrica obiettivo e dello sbilanciamento. È una
+conclusione metodologicamente solida e, sul piano pratico, operativa.

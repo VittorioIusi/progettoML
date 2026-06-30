@@ -1,0 +1,880 @@
+%==============================================================================
+%  Relazione di progetto -- Miglioramento di TabPFN-2.5 su classificazione
+%  binaria: adattamento interno (LoRA) e pipeline esterna.
+%  Compilare con: pdflatex relazione_completa.tex  (due volte per i riferimenti)
+%  Richiede nella stessa cartella: capitolo_pipeline_esterna.tex
+%==============================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[italian]{babel}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[hidelinks]{hyperref}
+
+% --- Stile per i blocchi di codice ------------------------------------------
+\definecolor{codegray}{gray}{0.95}
+\definecolor{codekw}{rgb}{0.13,0.29,0.53}
+\definecolor{codecmt}{rgb}{0.0,0.5,0.0}
+\definecolor{codestr}{rgb}{0.58,0.0,0.0}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecmt}\itshape,
+  stringstyle=\color{codestr},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  frame=single,
+  framesep=4pt,
+  breaklines=true,
+  showstringspaces=false,
+  language=Python,
+  captionpos=b,
+}
+
+\title{\textbf{Migliorare TabPFN-2.5 su classificazione binaria}\\
+\large Adattamento interno tramite LoRA e pipeline esterna di
+ensembling, calibrazione e soglia}
+\author{Progetto di Machine Learning}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Questo lavoro studia se e come sia possibile migliorare le prestazioni del
+\emph{tabular foundation model} TabPFN-2.5 su task di classificazione binaria,
+sotto il vincolo di \emph{non} riaddestrarne i pesi principali. Vengono
+esplorate due direzioni complementari. La prima, \emph{interna}, è un
+fine-tuning leggero basato su \emph{Low-Rank Adaptation} (LoRA): si descrive
+l'implementazione completa (iniezione e addestramento degli adapter) e si
+conducono tre esperimenti -- generalizzazione, ablation sulla capacità degli
+adapter e ablation sulla dimensione dei dati. La seconda, \emph{esterna},
+lascia i pesi congelati e agisce sull'output del modello: ensembling
+(self-ensemble ed eterogeneo), calibrazione delle probabilità (Platt e
+isotonica) e ottimizzazione della soglia decisionale per l'F1 macro, valutate
+con ripetizioni multiple e split a tre vie anti-leakage. I risultati convergono verso
+una tesi unica: TabPFN-2.5 è vicino all'ottimo non solo nella capacità
+discriminativa, ma anche nella calibrazione e nella varianza delle stime. Né il
+LoRA (anche con $4\times$ capacità o $60\times$ dati), né l'ensembling, né la
+ricalibrazione producono miglioramenti robusti. L'unico intervento con effetto
+reale è l'ottimizzazione della soglia, che migliora l'F1 macro di $4$--$5$ punti
+sui dataset sbilanciati: un guadagno che non tocca né i pesi né le probabilità,
+ma soltanto la regola di decisione. Si tratta di un risultato negativo per le
+tecniche di adattamento, ma metodologicamente solido e con un'indicazione
+pratica netta.
+\end{abstract}
+
+\tableofcontents
+\bigskip
+
+%==============================================================================
+\section{Introduzione}
+%==============================================================================
+
+\subsection{Contesto: TabPFN-2.5}
+TabPFN è un \emph{tabular foundation model} che affronta la classificazione su
+dati tabulari mediante \emph{in-context learning}: invece di essere addestrato
+su uno specifico dataset, il modello riceve in input l'intero training set come
+``contesto'' e produce le predizioni per le righe di test in un singolo forward
+pass, senza ottimizzazione dei pesi a tempo di utilizzo. I pesi del modello
+sono pre-addestrati una volta per tutte su milioni di dataset sintetici. In
+questo progetto si utilizza la versione \textbf{2.5} (non la v3, che è il
+default del pacchetto), che supporta dataset fino a circa $50\,000$ campioni.
+
+\subsection{Obiettivo e struttura della relazione}
+L'obiettivo è migliorare le prestazioni di TabPFN-2.5 su classificazione binaria
+senza riaddestrare i pesi principali, esplorando due famiglie di tecniche:
+\begin{itemize}[nosep]
+  \item un \textbf{adattamento interno} leggero tramite LoRA fine-tuning
+  (Sez.~\ref{sec:lora});
+  \item una \textbf{pipeline esterna} che agisce sull'output -- ensembling,
+  calibrazione e ottimizzazione della soglia (Sez.~\ref{sec:pipeline}).
+\end{itemize}
+La Sezione~\ref{sec:metodi} descrive i materiali e i metodi comuni (dati,
+metriche, architettura e implementazione). I due blocchi sperimentali sono
+volutamente speculari: il primo modifica il modello, il secondo lo lascia
+intatto e ne post-processa le uscite. La Sezione~\ref{sec:conclusioni} ne trae
+le conclusioni complessive.
+
+\subsection{Low-Rank Adaptation (LoRA)}
+LoRA è una tecnica di \emph{parameter-efficient fine-tuning}: dato un layer
+lineare con matrice di pesi $W \in \mathbb{R}^{d_{out}\times d_{in}}$, invece di
+aggiornare $W$ si congela e si aggiunge un termine a basso rango
+\begin{equation}
+  y = Wx + \frac{\alpha}{r}\, B A\, x,
+  \qquad A \in \mathbb{R}^{r\times d_{in}},\ B \in \mathbb{R}^{d_{out}\times r},
+  \label{eq:lora}
+\end{equation}
+dove $r \ll \min(d_{in},d_{out})$ è il \emph{rango} e $\alpha$ un fattore di
+scala. Si addestrano soltanto le matrici $A$ e $B$. All'inizializzazione si pone
+$B = 0$, cosicché il termine aggiuntivo è nullo e il modello parte
+numericamente identico a quello pre-addestrato; l'adattamento emerge solo
+durante l'addestramento. Il numero di parametri allenabili passa così da
+$d_{out}\,d_{in}$ a $r\,(d_{in}+d_{out})$, tipicamente una piccola frazione del
+totale.
+
+%==============================================================================
+\section{Materiali e metodi}
+\label{sec:metodi}
+%==============================================================================
+
+\subsection{Dataset e preprocessing}
+Sono stati utilizzati dataset binari da OpenML (Tabella~\ref{tab:dataset}).
+Per il fine-tuning LoRA si impiegano cinque dataset \emph{medici}; per la
+valutazione della generalizzazione, quattro dataset mai usati in addestramento.
+La pipeline esterna (Sez.~\ref{sec:pipeline}) riprende i quattro dataset di
+valutazione e vi aggiunge due dataset binari di grandi dimensioni
+(\texttt{bank\_marketing}, \texttt{magic\_telescope}), per stabilizzare le
+stime delle metriche di calibrazione su insiemi di test ampi.
+
+\begin{table}[h]
+\centering
+\caption{Dataset utilizzati (OpenML). I dataset di valutazione non sono mai
+stati impiegati per l'addestramento degli adapter.}
+\label{tab:dataset}
+\small
+\begin{tabular}{llrr}
+\toprule
+Ruolo & Dataset (OpenML ID) & Campioni & Feature \\
+\midrule
+Fine-tuning & \texttt{diabetes} (37)            & 768  & 8  \\
+Fine-tuning & \texttt{breast\_cancer} (1510)    & 569  & 30 \\
+Fine-tuning & \texttt{heart\_disease} (53)      & 270  & 13 \\
+Fine-tuning & \texttt{chronic\_kidney} (42972)  & 400  & 24 \\
+Fine-tuning & \texttt{hepatitis} (55)           & 155  & 19 \\
+\midrule
+Valutazione & \texttt{thyroid} (1000)           & 3772 & 28 \\
+Valutazione & \texttt{adult} (1590)             & 48842& 14 \\
+Valutazione & \texttt{credit\_g} (31)           & 1000 & 20 \\
+Valutazione & \texttt{blood\_transfusion} (1464)& 748  & 4  \\
+\midrule
+Pipeline (agg.) & \texttt{bank\_marketing} (1461)  & 45211 & 16 \\
+Pipeline (agg.) & \texttt{magic\_telescope} (1120) & 19020 & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Correzione degli identificativi.} Durante l'implementazione due ID
+forniti nelle specifiche iniziali si sono rivelati errati e sono stati corretti
+dopo verifica diretta su OpenML:
+\begin{itemize}[nosep]
+  \item \texttt{chronic\_kidney}: l'ID 40922 corrisponde in realtà al dataset
+  \texttt{Run\_or\_walk\_information} (attività fisica, non pertinente); è stato
+  sostituito con \textbf{42972} (\texttt{chronic-kidney-disease});
+  \item \texttt{thyroid}: l'ID 40082 corrisponde a un dataset di chimica con 347
+  classi (\texttt{QSAR-DATASET-\dots}); è stato sostituito con \textbf{1000}
+  (\texttt{hypothyroid}), binario.
+\end{itemize}
+
+\paragraph{Pipeline di caricamento.} È stato implementato un modulo
+(\texttt{utils/data\_loader.py}) che, per ciascun dataset: (1)~scarica i dati da
+OpenML con caching locale; (2)~codifica le feature categoriche con
+\texttt{OrdinalEncoder}, distinguendo numerico e categorico in modo robusto al
+\emph{backend} dei tipi (in \texttt{pandas}~3.0 le stringhe hanno dtype
+\texttt{str} Arrow, non \texttt{object}); (3)~imputa i valori mancanti con la
+mediana (\texttt{SimpleImputer}); (4)~codifica il target in formato binario
+$\{0,1\}$ con \texttt{LabelEncoder}, rimuovendo spazi/tabulazioni accidentali;
+(5)~scarta colonne identificative (es. \texttt{id}) che introdurrebbero
+\emph{data leakage}. La suddivisione è sempre stratificata.
+
+\subsection{Metriche di valutazione}
+Sono state implementate (modulo \texttt{evaluation/metrics.py}) quattro metriche
+per la classificazione binaria, due di discriminazione e due di calibrazione:
+\begin{itemize}[nosep]
+  \item \textbf{AUC-ROC}: area sotto la curva ROC, capacità di discriminazione;
+  \item \textbf{F1 macro}: media non pesata dell'F1 per classe, adatta a dataset
+  sbilanciati;
+  \item \textbf{Brier score}: $\frac{1}{N}\sum_i (p_i - y_i)^2$, errore quadratico
+  medio delle probabilità (calibrazione);
+  \item \textbf{Expected Calibration Error (ECE)}: suddividendo le probabilità in
+  $M=10$ bin di uguale ampiezza,
+  \begin{equation}
+    \mathrm{ECE} = \sum_{b=1}^{M} \frac{|B_b|}{N}\,
+    \bigl|\,\overline{p}(B_b) - \overline{y}(B_b)\,\bigr|,
+  \end{equation}
+  dove $\overline{p}(B_b)$ e $\overline{y}(B_b)$ sono la confidenza media e
+  l'accuratezza media nel bin $b$.
+\end{itemize}
+
+\subsection{Architettura di TabPFN-2.5 e punti di iniezione}
+\label{sec:arch}
+L'architettura (file \texttt{architectures/tabpfn\_v2\_5.py}) è composta da una
+pila di $L=24$ blocchi identici. Ogni blocco contiene due moduli di attenzione e
+un MLP:
+\begin{itemize}[nosep]
+  \item \texttt{per\_sample\_attention\_between\_features}: attenzione tra le
+  feature di una stessa riga;
+  \item \texttt{per\_column\_attention\_between\_cells}: attenzione tra le righe
+  di una stessa colonna (con \emph{multi-query attention} per le righe di test).
+\end{itemize}
+Entrambe ereditano da una classe \texttt{Attention} che definisce quattro
+proiezioni lineari \emph{senza bias}: \texttt{q\_projection},
+\texttt{k\_projection}, \texttt{v\_projection}, \texttt{out\_projection}, tutte
+$\mathbb{R}^{192\times192}$ (dimensione di embedding $d=192$, $3$ teste,
+\texttt{head\_dim}$=64$). Il modello completo conta circa $11{,}0$ milioni di
+parametri.
+
+I \textbf{punti di iniezione naturali} per LoRA sono dunque le proiezioni
+dell'attenzione. Adottando per default il classico schema ``QV'' (solo
+\texttt{q\_projection} e \texttt{v\_projection}) si ottengono
+\[
+  L \times 2~\text{(attenzioni)} \times 2~\text{(proiezioni)} = 24\times2\times2 = 96
+  \quad\text{adapter}.
+\]
+
+\subsection{Implementazione del modulo LoRA}
+Il modulo \texttt{models/lora.py} implementa l'Eq.~\eqref{eq:lora} come
+\emph{wrapper} attorno a un \texttt{nn.Linear} esistente, indipendentemente da
+TabPFN (e quindi testabile in isolamento). Il nucleo è riportato nel
+Listing~\ref{lst:lora}.
+
+\begin{lstlisting}[caption={Nucleo del wrapper \texttt{LoRALinear} (semplificato).},label=lst:lora]
+class LoRALinear(nn.Module):
+    def __init__(self, base_layer, r=8, alpha=16.0, dropout=0.0):
+        super().__init__()
+        self.base = base_layer                 # congelato
+        for p in self.base.parameters():
+            p.requires_grad = False
+        self.scaling = alpha / r
+        self.lora_A = nn.Parameter(torch.empty(r, base_layer.in_features))
+        self.lora_B = nn.Parameter(torch.empty(base_layer.out_features, r))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)            # B=0 -> parte come il modello base
+
+    def forward(self, x):
+        lora = (self.lora_dropout(x) @ self.lora_A.t()) @ self.lora_B.t()
+        return self.base(x) + self.scaling * lora
+\end{lstlisting}
+
+Sono inoltre fornite funzioni per: iniettare gli adapter individuando per nome i
+\texttt{nn.Linear} bersaglio (\texttt{inject\_lora\_adapters}); congelare tutti i
+parametri tranne quelli LoRA (\texttt{mark\_only\_lora\_as\_trainable});
+salvare/caricare i soli pesi degli adapter (pochi MB); e fondere gli adapter nei
+pesi base per l'inferenza (\texttt{merge}). Il modulo è stato validato con test
+unitari su CPU che verificano, fra l'altro, l'invarianza dell'output
+all'inizializzazione ($\lVert y_{\text{base}}-y_{\text{LoRA}}\rVert_\infty = 0$)
+e la corretta riproducibilità dopo salvataggio e ricarica degli adapter.
+
+\subsection{Procedura di addestramento LoRA}
+L'addestramento (modulo \texttt{models/tabpfn\_lora.py}) adotta un \emph{loop
+custom e trasparente}, che riutilizza le primitive di preprocessing di TabPFN ma
+controlla esplicitamente quali parametri vengono ottimizzati. Per ogni
+\emph{meta-batch} (corrispondente a un dataset, suddiviso in contesto e query):
+\begin{enumerate}[nosep]
+  \item si imposta il contesto in-context (\texttt{fit\_from\_preprocessed});
+  \item si calcolano i \emph{logits} grezzi sulle query
+  (\texttt{forward(\dots, return\_raw\_logits=True)});
+  \item si calcola la cross-entropy tra logits e label delle query;
+  \item si esegue \texttt{backward} e un passo di ottimizzazione,
+  \emph{aggiornando soltanto i parametri LoRA}.
+\end{enumerate}
+L'ottimizzatore è AdamW con \emph{learning rate} $10^{-4}$ e \emph{gradient
+clipping}. Per evitare l'esaurimento della memoria GPU su contesti ampi si
+abilita l'\emph{activation checkpointing} (ricalcolo delle attivazioni in fase di
+backward anziché memorizzazione).
+
+\paragraph{Early stopping.} Una porzione del training set (separata dal
+validation usato per il confronto finale, per evitare \emph{leakage}) viene
+riservata alla validazione interna: a ogni epoca si misura l'AUC, si conservano i
+pesi LoRA migliori e ci si arresta dopo un numero prefissato di epoche senza
+miglioramento, ripristinando il miglior checkpoint. Questo accorgimento si è
+rivelato essenziale (cfr.\ Sez.~\ref{sec:datasize}).
+
+%==============================================================================
+\section{Adattamento interno: LoRA fine-tuning}
+\label{sec:lora}
+%==============================================================================
+
+Gli esperimenti di questa sezione sono stati eseguiti su GPU (Google Colab,
+NVIDIA T4). Baseline e modello LoRA condividono lo stesso numero di estimatori in
+inferenza per garantire un confronto equo.
+
+\subsection{Esperimento 1: generalizzazione (training multi-dataset)}
+\label{sec:exp5}
+Un \emph{unico} adapter LoRA ($r=8$, $\alpha=16$, schema QV; $294{,}912$
+parametri allenabili pari al $2{,}68\%$ del totale) è stato addestrato
+congiuntamente sui cinque dataset medici e poi valutato sui quattro dataset di
+test mai visti, per misurare la generalizzazione dell'adattamento. Durante
+l'addestramento la media dell'AUC di validazione è salita da $0{,}920$ a
+$0{,}930$, indicando che gli adapter \emph{apprendono} qualcosa di specifico al
+dominio medico. I risultati sui dataset di test sono riportati in
+Tabella~\ref{tab:exp5}.
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 1 -- TabPFN base vs.\ TabPFN+LoRA sui dataset di
+valutazione. In \textbf{grassetto} il valore migliore per metrica e dataset.
+Frecce: $\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:exp5}
+\small
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{2}{*}{\texttt{adult}}
+ & base & \textbf{0.9220} & 0.8056 & \textbf{0.0920} & 0.0116 \\
+ & LoRA & 0.9219 & \textbf{0.8060} & 0.0921 & \textbf{0.0107} \\
+\addlinespace
+\multirow{2}{*}{\texttt{blood\_transfusion}}
+ & base & \textbf{0.7908} & \textbf{0.6643} & \textbf{0.1419} & 0.0948 \\
+ & LoRA & 0.7906 & \textbf{0.6643} & \textbf{0.1419} & \textbf{0.0909} \\
+\addlinespace
+\multirow{2}{*}{\texttt{credit\_g}}
+ & base & 0.7750 & \textbf{0.6796} & 0.1677 & \textbf{0.0399} \\
+ & LoRA & \textbf{0.7759} & \textbf{0.6796} & \textbf{0.1676} & 0.0454 \\
+\addlinespace
+\multirow{2}{*}{\texttt{thyroid}}
+ & base & \textbf{1.0000} & \textbf{0.9953} & \textbf{0.0014} & \textbf{0.0038} \\
+ & LoRA & \textbf{1.0000} & \textbf{0.9953} & 0.0016 & 0.0041 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Le differenze sono tutte dell'ordine della terza--quarta cifra decimale, ovvero
+entro il rumore statistico. Il LoRA \emph{non} migliora né peggiora in modo
+significativo la discriminazione; si osserva un debole e non robusto vantaggio
+sulla calibrazione (ECE migliore in 2 dataset su 4). Da notare che il dataset
+medico tra i test (\texttt{thyroid}) è saturo (AUC $=1{,}0000$), quindi non offre
+margine di osservazione del transfer in-dominio.
+
+\subsection{Esperimento 2: ablation sulla capacità}
+\label{sec:capacity}
+Per verificare se l'assenza di miglioramento dipenda da una capacità
+insufficiente degli adapter, l'Esperimento~1 è stato ripetuto con tre
+configurazioni crescenti (Tabella~\ref{tab:capacity}).
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 2 -- configurazioni LoRA a capacità crescente. La migliore
+AUC di validazione (sui dati medici) resta costante.}
+\label{tab:capacity}
+\small
+\begin{tabular}{lrrc}
+\toprule
+Config. & Target & Param.\ allenabili & Best val AUC \\
+\midrule
+\texttt{r8\_qv}    & q, v       & $294{,}912$\ ($2{,}7\%$)  & 0.9294 \\
+\texttt{r16\_qv}   & q, v       & $589{,}824$\ ($5{,}2\%$)  & 0.9295 \\
+\texttt{r16\_qkvo} & q, k, v, o & $1{,}179{,}648$\ ($9{,}9\%$) & 0.9295 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Quadruplicando i parametri allenabili (dal $2{,}7\%$ al $9{,}9\%$) la migliore
+AUC di validazione resta sostanzialmente invariata ($0{,}9295$) e le metriche sui
+dataset di test sono indistinguibili; in un caso (F1 su \texttt{credit\_g}) la
+configurazione più capiente peggiora leggermente, suggerendo un principio di
+overfitting. Si conclude che \textbf{la capacità degli adapter non è il fattore
+limitante}.
+
+\subsection{Esperimento 3: ablation sulla dimensione dei dati}
+\label{sec:datasize}
+La seconda ipotesi è che i dataset di fine-tuning, essendo piccoli
+($155$--$768$ righe), forniscano troppi pochi passi di gradiente. Per testarla,
+un adapter ($r=8$, QV) è stato addestrato e valutato \emph{in-distribution} su un
+dataset medico ampio, \texttt{Cardiovascular-Disease} (OpenML~45547), ridotto a
+$40\,000$ campioni per rispettare il limite di TabPFN ($\sim$$50\,000$):
+$32\,000$ righe di training (circa $60$ volte i dataset piccoli, suddivise in
+$\sim$$8$ chunk per epoca) e $8\,000$ di test.
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 3 -- TabPFN base vs.\ LoRA su \texttt{cardiovascular}
+($32\,000$ righe di training, valutazione in-distribution).}
+\label{tab:datasize}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+base & \textbf{0.7984} & \textbf{0.7291} & 0.1826 & 0.0275 \\
+LoRA & 0.7983 & 0.7290 & \textbf{0.1824} & \textbf{0.0229} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Nonostante $60$ volte più dati, il LoRA resta equivalente al baseline sulla
+discriminazione (Tabella~\ref{tab:datasize}); l'unico miglioramento netto è di
+nuovo sulla calibrazione (ECE $0{,}0229$ vs.\ $0{,}0275$). \textbf{Anche
+l'ipotesi della scarsità di dati è quindi rigettata.}
+
+Particolarmente istruttiva è la dinamica dell'addestramento
+(Figura~\ref{fig:valauc}): la AUC di validazione raggiunge il massimo
+($0{,}8045$) già all'epoca~5 e poi \emph{decresce} monotonicamente
+($0{,}7789$ all'epoca~30), mentre la loss di training cresce. In altre parole, il
+modello parte $\approx$ base (per via di $B=0$) e ogni ulteriore addestramento lo
+\emph{allontana} dalla soluzione ottimale, peggiorandolo; solo l'early stopping
+preserva le prestazioni. Si noti infine che \texttt{cardiovascular} non è saturo
+(AUC $\approx 0{,}80$): esisteva margine di miglioramento, eppure il LoRA non lo
+ha colto.
+
+\begin{figure}[h]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.78\textwidth, height=6cm,
+    xlabel={Epoca di addestramento},
+    ylabel={AUC di validazione},
+    xmin=3, xmax=32, ymin=0.775, ymax=0.808,
+    xtick={5,10,15,20,25,30},
+    ytick={0.78,0.785,0.79,0.795,0.80,0.805},
+    yticklabel style={/pgf/number format/fixed, /pgf/number format/precision=3},
+    grid=major, grid style={gray!25},
+    tick label style={font=\footnotesize},
+    label style={font=\small},
+    every axis plot/.append style={very thick},
+]
+% Andamento della AUC di validazione (cardiovascular, LoRA r=8 QV)
+\addplot[color=blue, mark=*, mark size=2pt] coordinates {
+    (5,0.8045) (15,0.8011) (20,0.7966) (25,0.7882) (30,0.7789)
+};
+% Evidenzia il massimo (early stopping) all'epoca 5
+\addplot[only marks, mark=o, mark size=5pt, red, very thick]
+    coordinates {(5,0.8045)};
+\node[anchor=south west, font=\footnotesize, red] at (axis cs:5,0.8045)
+    {max (early stop)};
+% Livello del baseline TabPFN per riferimento
+\addplot[dashed, gray, thick] coordinates {(3,0.7984) (32,0.7984)};
+\node[anchor=south east, font=\footnotesize, gray] at (axis cs:32,0.7984)
+    {base 0.7984};
+\end{axis}
+\end{tikzpicture}
+\caption{Dinamica dell'early stopping nell'Esperimento~3 (\texttt{cardiovascular},
+adapter $r=8$ QV). La AUC di validazione è massima all'epoca~5 e poi
+\emph{decresce} monotonicamente: l'addestramento prolungato allontana il modello
+dalla soluzione ottimale. La linea tratteggiata è il livello del baseline TabPFN.}
+\label{fig:valauc}
+\end{figure}
+
+\subsection{Discussione del fine-tuning LoRA}
+\label{sec:lora-discussione}
+I tre esperimenti convergono verso una conclusione coerente
+(Tabella~\ref{tab:summary}). Il LoRA fine-tuning non migliora la capacità
+discriminativa di TabPFN-2.5 su classificazione binaria tabulare. Le due
+spiegazioni alternative più naturali sono state escluse sperimentalmente:
+\begin{itemize}[nosep]
+  \item \textbf{non è un problema di capacità}: un aumento di $4\times$ dei
+  parametri allenabili non produce alcun cambiamento (Sez.~\ref{sec:capacity});
+  \item \textbf{non è un problema di dati}: un aumento di $\sim$$60\times$ dei
+  dati di training non produce miglioramenti, e un addestramento prolungato
+  degrada il modello (Sez.~\ref{sec:datasize}).
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Sintesi degli esperimenti LoRA e delle ipotesi testate.}
+\label{tab:summary}
+\small
+\begin{tabular}{lll}
+\toprule
+Ipotesi & Esperimento & Esito \\
+\midrule
+Generalizzazione fuori dominio & Exp.~1 (medici $\to$ test) & LoRA $\approx$ base, non distruttivo \\
+Capacità insufficiente & Exp.~2 (ablation $r$, target) & nessun cambiamento \\
+Dati insufficienti & Exp.~3 ($60\times$ dati) & nessun gain; over-training degrada \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+La spiegazione residua, e più solida, è che \textbf{i pesi pre-addestrati di
+TabPFN-2.5 sono già vicini all'ottimo} per questa classe di problemi: il suo
+in-context learning estrae quasi tutto il segnale disponibile, e un adattamento a
+basso rango non può aggiungervi capacità discriminativa, potendo solo
+allontanarsi dal buon punto di partenza. Un aspetto positivo è che l'adattamento
+risulta \emph{non distruttivo}: pur essendo addestrato solo su dati medici, non
+degrada le prestazioni sui dataset di test non medici, evidenziando robustezza
+allo \emph{shift} di dominio. Inoltre, l'unico segnale ricorrente -- per quanto
+modesto -- è il miglioramento della \emph{calibrazione} (ECE), il che suggerisce
+che eventuali benefici vadano cercati nel post-processing piuttosto che
+nell'adattamento dei pesi: è esattamente la direzione esplorata nella
+Sezione~\ref{sec:pipeline}.
+
+\paragraph{Note implementative rilevanti.} Durante lo sviluppo sono emersi alcuni
+accorgimenti tecnici necessari: (i)~l'early stopping è indispensabile, poiché
+l'addestramento può degradare il modello; (ii)~su dataset grandi occorre
+abilitare l'\emph{activation checkpointing} per non esaurire la memoria della GPU
+in fase di training; (iii)~per dataset oltre il limite ufficiale va impostato
+\texttt{ignore\_pretraining\_limits=True}.
+
+%==============================================================================
+\section{Pipeline esterna: ensembling, calibrazione e soglia}
+\label{sec:pipeline}
+%==============================================================================
+
+\subsection{Motivazione e approccio}
+Il capitolo precedente ha stabilito che il fine-tuning a basso rango non
+migliora la capacità discriminativa di TabPFN-2.5: i pesi pre-addestrati sono
+già vicini all'ottimo e l'unico segnale ricorrente -- per quanto modesto -- è
+sul versante della \emph{calibrazione}. Questa osservazione indirizza la
+seconda parte del lavoro: invece di modificare il modello, lo si tratta come un
+predittore \textbf{congelato} e si interviene unicamente sul suo
+\textbf{output} (le probabilità della classe positiva). È l'approccio speculare
+al LoRA: il valore aggiunto va cercato \emph{attorno} al modello, su assi che
+l'adattamento dei pesi non può raggiungere.
+
+Vengono studiati due blocchi, ciascuno mirato a un diverso asse della qualità
+predittiva:
+\begin{itemize}[nosep]
+  \item \textbf{Ensembling} (Esp.~4): combinare più predizioni per ridurre la
+  varianza della stima, con l'obiettivo di migliorare la discriminazione
+  (AUC-ROC);
+  \item \textbf{Calibrazione e ottimizzazione della soglia} (Esp.~5):
+  post-processare le probabilità per migliorarne l'affidabilità (ECE, Brier) e
+  scegliere il \emph{cutoff} decisionale ottimale per l'F1 macro.
+\end{itemize}
+
+\paragraph{Quale intervento muove quale metrica.} I due blocchi sono
+complementari e non ridondanti: ciascuno agisce su un asse distinto, come
+riassunto nella Tabella~\ref{tab:chimuovecosa}. Questa separazione è la chiave
+di lettura dei risultati: un ensembling che riordina i campioni può spostare
+l'AUC; una trasformazione monotona delle probabilità (calibrazione) ne migliora
+l'affidabilità senza toccarne l'ordinamento, quindi lascia l'AUC invariata; la
+sola scelta della soglia agisce esclusivamente sull'F1.
+
+\begin{table}[h]
+\centering
+\caption{Asse di azione atteso di ciascun intervento. ``='' indica invarianza
+attesa per costruzione (es.\ una trasformazione monotona non altera l'AUC).}
+\label{tab:chimuovecosa}
+\small
+\begin{tabular}{lcccc}
+\toprule
+Intervento & AUC-ROC & F1 & Brier & ECE \\
+\midrule
+Ensembling (Esp.~4)            & \checkmark & (\checkmark) & --         & --         \\
+Calibrazione (Esp.~5a)         & $=$        & $=$          & \checkmark & \checkmark \\
+Ottimizzazione soglia (Esp.~5b)& $=$        & \checkmark   & $=$        & $=$        \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metodologia sperimentale}
+\label{sec:pipeline-metodo}
+
+\paragraph{Dataset.} Gli esperimenti riprendono i quattro dataset di
+valutazione del capitolo LoRA (\texttt{thyroid}, \texttt{adult},
+\texttt{credit\_g}, \texttt{blood\_transfusion}), così da consentire un
+confronto diretto, e vi aggiungono due dataset binari di grandi dimensioni --
+\texttt{bank\_marketing} (OpenML~1461, $45\,211$ righe) e
+\texttt{magic\_telescope} (OpenML~1120, $19\,020$ righe). La ragione è
+metodologica: le metriche di calibrazione (in particolare l'ECE, basato su 10
+bin) sono rumorose su insiemi di test piccoli; i due dataset \texttt{credit\_g}
+($1\,000$) e \texttt{blood\_transfusion} ($748$) sono troppo ridotti perché le
+conclusioni su calibrazione e soglia siano robuste se prese isolatamente, mentre
+i dataset grandi forniscono insiemi di test ampi e stime stabili.
+
+\paragraph{Split a tre vie e assenza di leakage.} Per ciascun dataset si adotta
+una suddivisione stratificata in tre parti: \emph{train/context}
+($50\%$), su cui TabPFN esegue l'in-context learning; \emph{calibration}
+($25\%$), su cui si stimano il calibratore e la soglia ottimale; e \emph{test}
+($25\%$), su cui si misurano tutte le metriche. Calibratore e soglia sono
+fittati \emph{esclusivamente} sul set di calibrazione, mai sul test: è lo stesso
+principio anti-leakage dell'early stopping del capitolo precedente. I dataset
+più grandi sono campionati fino a un massimo prefissato per contenere i tempi di
+inferenza su CPU, mantenendo comunque insiemi di test ampi.
+
+\paragraph{Ripetizioni e riproducibilità.} L'intera procedura (split, fit,
+valutazione) è ripetuta su più semi indipendenti ($5$ per l'Esp.~5, $3$ per
+l'Esp.~4, computazionalmente più oneroso). I risultati sono riportati come
+media $\pm$ deviazione standard sulle ripetizioni: ciò quantifica esplicitamente
+il rumore, rilevante soprattutto sui dataset piccoli, ed evita di trarre
+conclusioni da un singolo split fortunato.
+
+\subsection{Esperimento 4: ensembling}
+\label{sec:exp-ensemble}
+Si confrontano tre strategie, tutte a pesi congelati:
+\begin{itemize}[nosep]
+  \item \texttt{base}: una singola istanza di TabPFN (riferimento);
+  \item \texttt{self\_ensemble}: media delle probabilità di $5$ istanze di
+  TabPFN con semi interni diversi (diverse permutazioni/preprocessing). Misura il
+  guadagno ottenibile dalla sola riduzione della varianza interna del modello,
+  senza ricorrere ad altri modelli;
+  \item \texttt{tabpfn+gbm}: media tra TabPFN e un \texttt{GradientBoosting}
+  addestrato sullo stesso contesto (ensemble eterogeneo).
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 4 -- ensembling. Media (deviazione standard) su $3$ semi.
+In \textbf{grassetto} la migliore AUC-ROC per dataset (metrica bersaglio).
+$\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:ensemble}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Metodo & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{3}{*}{\texttt{credit\_g}}
+ & base          & \textbf{0.793 (0.046)} & 0.644 (0.024) & 0.163 (0.014) & 0.061 (0.011) \\
+ & self\_ensemble& \textbf{0.793 (0.043)} & 0.660 (0.031) & 0.163 (0.013) & 0.058 (0.003) \\
+ & tabpfn+gbm    & 0.790 (0.061) & 0.670 (0.055) & 0.162 (0.020) & 0.060 (0.004) \\
+\addlinespace
+\multirow{3}{*}{\texttt{blood\_transfusion}}
+ & base          & \textbf{0.783 (0.034)} & 0.653 (0.018) & 0.144 (0.012) & 0.052 (0.009) \\
+ & self\_ensemble& 0.782 (0.035) & 0.653 (0.011) & 0.144 (0.012) & 0.056 (0.004) \\
+ & tabpfn+gbm    & 0.768 (0.033) & 0.658 (0.029) & 0.150 (0.014) & 0.052 (0.023) \\
+\addlinespace
+\multirow{3}{*}{\texttt{thyroid}}
+ & base          & 0.999 (0.001) & 0.980 (0.008) & 0.005 (0.001) & 0.005 (0.000) \\
+ & self\_ensemble& 0.999 (0.001) & 0.979 (0.012) & 0.005 (0.002) & 0.006 (0.000) \\
+ & tabpfn+gbm    & \textbf{0.999 (0.001)} & 0.986 (0.002) & 0.004 (0.001) & 0.004 (0.001) \\
+\addlinespace
+\multirow{3}{*}{\texttt{adult}}
+ & base          & 0.913 (0.006) & 0.795 (0.012) & 0.098 (0.003) & 0.020 (0.005) \\
+ & self\_ensemble& 0.913 (0.006) & 0.792 (0.011) & 0.098 (0.003) & 0.018 (0.006) \\
+ & tabpfn+gbm    & \textbf{0.915 (0.008)} & 0.795 (0.004) & 0.096 (0.004) & 0.019 (0.005) \\
+\addlinespace
+\multirow{3}{*}{\texttt{bank\_marketing}}
+ & base          & 0.933 (0.006) & 0.740 (0.018) & 0.063 (0.004) & 0.019 (0.004) \\
+ & self\_ensemble& \textbf{0.936 (0.006)} & 0.747 (0.014) & 0.062 (0.004) & 0.013 (0.002) \\
+ & tabpfn+gbm    & 0.929 (0.007) & 0.725 (0.017) & 0.065 (0.004) & 0.021 (0.002) \\
+\addlinespace
+\multirow{3}{*}{\texttt{magic\_telescope}}
+ & base          & 0.943 (0.004) & 0.876 (0.006) & 0.082 (0.004) & 0.014 (0.005) \\
+ & self\_ensemble& \textbf{0.944 (0.004)} & 0.877 (0.004) & 0.081 (0.004) & 0.016 (0.005) \\
+ & tabpfn+gbm    & 0.940 (0.003) & 0.872 (0.009) & 0.085 (0.003) & 0.030 (0.005) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+I risultati (Tabella~\ref{tab:ensemble}) indicano che \textbf{l'ensembling non
+migliora la discriminazione} di TabPFN-2.5.
+
+\paragraph{Self-ensemble: nessun guadagno oltre il rumore.} Mediare le
+probabilità di cinque istanze di TabPFN produce variazioni di AUC dell'ordine di
+$\pm 0{,}003$, sistematicamente \emph{interne} alla deviazione standard fra i
+semi (che va da $0{,}004$ a $0{,}046$): il più ampio, su \texttt{bank\_marketing}
+($0{,}933 \to 0{,}936$), resta entro un errore standard. Il motivo è strutturale:
+TabPFN esegue già internamente un ensemble su più permutazioni del contesto
+(parametro \texttt{n\_estimators}), quindi la varianza residua del singolo
+modello è bassa e mediare ulteriori copie non aggiunge informazione. Si osserva
+al più un lieve effetto di \emph{smoothing} sull'ECE in un paio di casi
+(\texttt{bank\_marketing} $0{,}019 \to 0{,}013$), comunque modesto.
+
+\paragraph{Ensemble eterogeneo: tendenzialmente controproducente.} Mediare
+TabPFN con un \texttt{GradientBoosting} \emph{abbassa} l'AUC nella maggioranza
+dei dataset (\texttt{blood\_transfusion} $0{,}783 \to 0{,}768$,
+\texttt{magic\_telescope} $0{,}943 \to 0{,}940$, \texttt{bank\_marketing}
+$0{,}933 \to 0{,}929$): essendo il GBM mediamente più debole di TabPFN su questi
+problemi, la media viene trascinata verso il modello peggiore. L'unica eccezione
+è \texttt{thyroid}, dove il GBM è competitivo e il mix ottiene il miglior F1
+($0{,}986$); su \texttt{adult} il vantaggio di AUC ($+0{,}002$) è marginale.
+In assenza di un peso adattivo o di un modello esterno almeno pari a TabPFN,
+l'ensemble eterogeneo non è una strategia affidabile.
+
+\subsection{Esperimento 5: calibrazione e ottimizzazione della soglia}
+\label{sec:exp-calib}
+A partire dalle probabilità grezze di TabPFN si confrontano quattro varianti:
+\begin{itemize}[nosep]
+  \item \texttt{base}: probabilità grezze, soglia $0{,}5$ (riferimento);
+  \item \texttt{platt}: calibrazione con \emph{Platt scaling} (regressione
+  logistica a una variabile sulle probabilità di calibrazione);
+  \item \texttt{isotonic}: calibrazione con \emph{regressione isotonica}
+  (mappatura monotona non parametrica, più flessibile ma più avida di dati);
+  \item \texttt{threshold}: probabilità grezze ma con soglia scelta per
+  massimizzare l'F1 macro sul set di calibrazione.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\caption{Esperimento 5 -- calibrazione e soglia. Media (deviazione standard)
+su $5$ semi. In \textbf{grassetto} il miglior F1 e il miglior ECE per dataset.
+$\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+\label{tab:calib}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llcccc}
+\toprule
+Dataset & Metodo & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+\midrule
+\multirow{4}{*}{\texttt{credit\_g}}
+ & base      & 0.801 (0.034) & 0.657 (0.025) & 0.161 (0.010) & 0.061 (0.011) \\
+ & platt     & 0.801 (0.034) & 0.618 (0.019) & 0.167 (0.006) & 0.084 (0.021) \\
+ & isotonic  & 0.789 (0.033) & 0.681 (0.044) & 0.166 (0.016) & \textbf{0.059 (0.037)} \\
+ & threshold & 0.801 (0.034) & \textbf{0.710 (0.035)} & 0.161 (0.010) & 0.061 (0.011) \\
+\addlinespace
+\multirow{4}{*}{\texttt{blood\_transfusion}}
+ & base      & 0.743 (0.066) & 0.644 (0.019) & 0.153 (0.017) & 0.073 (0.031) \\
+ & platt     & 0.743 (0.066) & 0.451 (0.033) & 0.160 (0.005) & 0.073 (0.020) \\
+ & isotonic  & 0.733 (0.061) & 0.606 (0.091) & 0.156 (0.011) & \textbf{0.057 (0.024)} \\
+ & threshold & 0.743 (0.066) & \textbf{0.678 (0.036)} & 0.153 (0.017) & 0.073 (0.031) \\
+\addlinespace
+\multirow{4}{*}{\texttt{thyroid}}
+ & base      & 0.999 (0.001) & 0.977 (0.008) & 0.005 (0.001) & 0.006 (0.001) \\
+ & platt     & 0.999 (0.001) & 0.977 (0.006) & 0.006 (0.001) & 0.017 (0.003) \\
+ & isotonic  & 0.992 (0.008) & 0.978 (0.007) & 0.006 (0.001) & \textbf{0.005 (0.001)} \\
+ & threshold & 0.999 (0.001) & \textbf{0.978 (0.008)} & 0.005 (0.001) & 0.006 (0.001) \\
+\addlinespace
+\multirow{4}{*}{\texttt{adult}}
+ & base      & 0.917 (0.007) & 0.798 (0.011) & 0.096 (0.004) & 0.019 (0.004) \\
+ & platt     & 0.917 (0.007) & 0.791 (0.011) & 0.098 (0.004) & 0.046 (0.003) \\
+ & isotonic  & 0.915 (0.007) & 0.790 (0.021) & 0.097 (0.004) & \textbf{0.019 (0.009)} \\
+ & threshold & 0.917 (0.007) & \textbf{0.804 (0.010)} & 0.096 (0.004) & 0.019 (0.004) \\
+\addlinespace
+\multirow{4}{*}{\texttt{bank\_marketing}}
+ & base      & 0.931 (0.005) & 0.742 (0.015) & 0.063 (0.003) & 0.019 (0.003) \\
+ & platt     & 0.931 (0.005) & 0.732 (0.019) & 0.067 (0.003) & 0.034 (0.004) \\
+ & isotonic  & 0.929 (0.006) & 0.739 (0.030) & 0.064 (0.003) & \textbf{0.015 (0.006)} \\
+ & threshold & 0.931 (0.005) & \textbf{0.784 (0.006)} & 0.063 (0.003) & 0.019 (0.003) \\
+\addlinespace
+\multirow{4}{*}{\texttt{magic\_telescope}}
+ & base      & 0.944 (0.005) & 0.877 (0.004) & 0.081 (0.004) & \textbf{0.014 (0.003)} \\
+ & platt     & 0.944 (0.005) & \textbf{0.878 (0.005)} & 0.083 (0.004) & 0.029 (0.006) \\
+ & isotonic  & 0.943 (0.005) & 0.877 (0.005) & 0.081 (0.003) & 0.018 (0.005) \\
+ & threshold & 0.944 (0.005) & 0.877 (0.004) & 0.081 (0.004) & \textbf{0.014 (0.003)} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+I risultati (Tabella~\ref{tab:calib}) raccontano una storia netta, in parte
+diversa dalle attese.
+
+\paragraph{La soglia è il guadagno reale, concentrato sugli sbilanciati.}
+L'ottimizzazione della soglia migliora l'F1 macro su tutti e sei i dataset
+lasciando \emph{esattamente} invariate AUC, Brier ed ECE -- come previsto dalla
+Tabella~\ref{tab:chimuovecosa}, poiché agisce solo sulla regola di decisione e
+non sulle probabilità. L'entità del guadagno scala con lo sbilanciamento: è
+sostanziale su \texttt{credit\_g} ($F1: 0{,}657 \to 0{,}710$, $+5{,}3$ punti) e
+\texttt{bank\_marketing} ($0{,}742 \to 0{,}784$, $+4{,}2$ punti, classe
+positiva al $12\%$), apprezzabile su \texttt{blood\_transfusion}
+($0{,}644 \to 0{,}678$) e \texttt{adult} ($0{,}798 \to 0{,}804$), e nullo sui
+dataset bilanciati o saturi (\texttt{magic\_telescope}, \texttt{thyroid}), dove
+la soglia $0{,}5$ è già ottimale. È il risultato positivo più chiaro e robusto
+dell'intero progetto: un intervento a costo nullo che corregge il \emph{cutoff}
+decisionale là dove l'asimmetria di classe rende l'F1 a soglia fissa
+sub-ottimale.
+
+\paragraph{La calibrazione non aiuta, perché TabPFN è già ben calibrato.}
+Il dato più informativo è l'ECE del modello \texttt{base}: $0{,}019$ su
+\texttt{adult} e \texttt{bank\_marketing}, $0{,}014$ su \texttt{magic\_telescope},
+$0{,}006$ su \texttt{thyroid}. Sono valori già molto bassi: le probabilità di
+TabPFN sono affidabili \emph{senza} alcun post-processing. Di conseguenza la
+ricalibrazione ha poco margine e, anzi, tende a peggiorare: il \textbf{Platt
+scaling} aumenta l'ECE quasi ovunque (es.\ \texttt{adult} $0{,}019 \to 0{,}046$,
+\texttt{thyroid} $0{,}006 \to 0{,}017$) perché impone una sigmoide a
+probabilità che già non ne hanno bisogno, e sui dataset piccoli ne distorce
+gravemente l'F1 (\texttt{blood\_transfusion} $0{,}644 \to 0{,}451$). La
+\textbf{regressione isotonica} è più prudente e ottiene il miglior ECE in
+cinque dataset su sei, ma con margini minimi (es.\ \texttt{bank\_marketing}
+$0{,}019 \to 0{,}015$) e al prezzo di un lieve calo di AUC, dovuto ai
+\emph{gradini} della mappatura che introducono pareggi nel \emph{ranking}
+(\texttt{thyroid} $0{,}999 \to 0{,}992$). Nessuno dei due giustifica
+l'adozione come passo standard.
+
+\paragraph{Sintesi.} Degli interventi di post-processing, solo
+l'ottimizzazione della soglia produce un beneficio consistente, e unicamente
+sull'F1 dei dataset sbilanciati. La calibrazione è superflua perché il modello
+è già calibrato: un risultato che \emph{estende} la conclusione del capitolo
+LoRA -- dove l'unico segnale era proprio sull'ECE -- mostrando che quel margine,
+misurato qui rigorosamente, è in realtà trascurabile.
+
+\subsection{Discussione del capitolo}
+\label{sec:pipeline-discussione}
+I due esperimenti convergono con il capitolo precedente verso un'unica tesi
+coerente. Degli interventi esterni considerati -- che agiscono sull'output senza
+toccare i pesi -- due su tre \emph{non} producono alcun miglioramento robusto:
+\begin{itemize}[nosep]
+  \item l'\textbf{ensembling} non migliora l'AUC, perché la varianza del
+  singolo modello è già bassa (TabPFN ensembla internamente) e mediare con un
+  modello esterno più debole è dannoso (Sez.~\ref{sec:exp-ensemble});
+  \item la \textbf{calibrazione} non migliora l'ECE, perché le probabilità di
+  TabPFN sono già affidabili: il Platt scaling le peggiora e la regressione
+  isotonica le ritocca solo marginalmente (Sez.~\ref{sec:exp-calib}).
+\end{itemize}
+L'unico intervento con un effetto reale e prevedibile è l'\textbf{ottimizzazione
+della soglia} per l'F1 macro, efficace là dove lo sbilanciamento di classe rende
+sub-ottimale il \emph{cutoff} di default ($+4$--$5$ punti di F1 su
+\texttt{bank\_marketing} e \texttt{credit\_g}). È significativo che si tratti
+dell'unico intervento che non modifica né i pesi né le probabilità, ma soltanto
+la \emph{regola di decisione} che le traduce in classi.
+
+Letta insieme al capitolo sul LoRA, l'evidenza complessiva è netta: TabPFN-2.5
+è vicino all'ottimo non solo nella capacità discriminativa, ma anche nella
+\emph{calibrazione} e nella \emph{varianza} delle sue stime. Né l'adattamento dei
+pesi (LoRA), né l'ensembling, né la ricalibrazione aggiungono valore; il debole
+segnale sull'ECE intravisto nel fine-tuning, qui misurato con ripetizioni e
+deviazioni standard, si rivela trascurabile. Il margine di miglioramento residuo
+non è nel modello né nelle probabilità, ma nella decisione finale: scegliere la
+soglia in funzione della metrica obiettivo e dello sbilanciamento. È una
+conclusione metodologicamente solida e, sul piano pratico, operativa.
+
+%==============================================================================
+\section{Conclusioni generali}
+\label{sec:conclusioni}
+%==============================================================================
+Il progetto ha implementato e validato un sistema completo per migliorare
+TabPFN-2.5 su classificazione binaria lungo due direzioni complementari, senza
+mai riaddestrarne i pesi principali: un adattamento interno tramite LoRA
+fine-tuning e una pipeline esterna di post-processing. L'infrastruttura
+realizzata comprende il caricamento e il preprocessing robusto dei dati, quattro
+metriche di valutazione, l'iniezione e l'addestramento degli adapter LoRA con
+early stopping, e gli helper per ensembling, calibrazione e ottimizzazione della
+soglia.
+
+Sul piano sperimentale, cinque esperimenti con ripetizioni e ablation
+convergono verso un'unica conclusione: \textbf{TabPFN-2.5 è vicino all'ottimo non
+solo nella discriminazione, ma anche nella calibrazione e nella varianza delle
+sue stime}. Ne consegue che:
+\begin{itemize}[nosep]
+  \item il LoRA fine-tuning non migliora la discriminazione, e ciò non dipende
+  né dalla capacità degli adapter né dalla quantità di dati;
+  \item l'ensembling non riduce ulteriormente la varianza, già bassa per via
+  dell'ensemble interno del modello;
+  \item la ricalibrazione delle probabilità è superflua, perché esse sono già
+  ben calibrate (ECE di base $\le 0{,}02$ sui dataset grandi).
+\end{itemize}
+
+L'unico intervento con un effetto reale e prevedibile è l'\textbf{ottimizzazione
+della soglia decisionale} per l'F1 macro, che produce guadagni di $4$--$5$ punti
+sui dataset sbilanciati. È un risultato dal valore sia teorico sia pratico: il
+margine di miglioramento residuo per un \emph{foundation model} tabulare già
+maturo non risiede nel modello né nelle sue probabilità, ma nella regola di
+decisione che le traduce in classi, da scegliere in funzione della metrica
+obiettivo e dello sbilanciamento. I risultati negativi sulle tecniche di
+adattamento, ottenuti con metodologia rigorosa (split anti-leakage, ripetizioni
+multiple, deviazioni standard), sono essi stessi un contributo informativo
+sullo stato dell'arte dei modelli tabulari pre-addestrati.
+
+%==============================================================================
+\appendix
+\section{Struttura del codice}
+%==============================================================================
+\begin{itemize}[nosep]
+  \item \texttt{utils/data\_loader.py} -- caricamento, caching, encoding e split
+  dei dataset OpenML.
+  \item \texttt{evaluation/metrics.py} -- AUC-ROC, F1 macro, Brier, ECE; tabelle
+  comparative e salvataggio CSV.
+  \item \texttt{models/lora.py} -- implementazione di LoRA (\texttt{LoRALinear},
+  iniezione, salvataggio/caricamento, merge).
+  \item \texttt{models/tabpfn\_lora.py} -- integrazione con TabPFN: costruzione
+  del classificatore con adapter, loop di training, early stopping, esperimenti
+  (\texttt{run\_lora\_exp5}, \texttt{run\_lora\_ablation},
+  \texttt{run\_lora\_datasize\_experiment}).
+  \item \texttt{pipeline/external\_pipeline.py} -- pipeline esterna: helper puri
+  (\texttt{average\_probas}, \texttt{fit\_calibrator}, \texttt{optimize\_threshold})
+  ed esperimenti (\texttt{run\_ensemble\_experiment},
+  \texttt{run\_calibration\_threshold\_experiment}); split a tre vie e
+  aggregazione media$\pm$std su più semi.
+\end{itemize}
+
+\noindent\textit{Codice e configurazione completi sono versionati nel repository
+del progetto. Il modello TabPFN-2.5 è eseguito localmente; il primo download dei
+pesi richiede un token di licenza Prior Labs.}
+
+\end{document}

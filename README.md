@@ -56,15 +56,46 @@ python evaluation/metrics.py
 python models/lora.py
 ```
 
-## Dataset
+## Dataset ed esperimenti LoRA
 
-- **Fine-tuning LoRA** (medici): diabetes (37), breast_cancer (1510),
-  heart_disease (53), chronic_kidney (42972), hepatitis (55).
-- **Valutazione**: thyroid (1000), adult (1590), credit_g (31),
-  blood_transfusion (1464).
+La configurazione del fine-tuning LoRA è stata spostata dal **dominio medico**
+(dataset troppo piccoli, 155–768 righe) a un **dominio finanziario/creditizio**,
+con due obiettivi: (1) usare dataset abbastanza grandi da fornire molti passi di
+gradiente; (2) valutare **in-domain** (finanziario → finanziario) invece che
+cross-domain, così da rispondere correttamente alla domanda *"il LoRA
+specializza TabPFN su uno specifico settore?"*.
 
-> Nota sugli ID OpenML corretti (alcuni ID iniziali erano errati):
-> - `chronic_kidney` usa **42972** (`chronic-kidney-disease`); l'ID 40922 era
->   `Run_or_walk_information` (non pertinente).
-> - `thyroid` usa **1000** (`hypothyroid`, binario); l'ID 40082 era un dataset
->   di chimica con 347 classi (`QSAR-DATASET-...`), non binario.
+- **Fine-tuning LoRA** (finanziari): `bank_marketing` (1461, 45.211),
+  `default_credit` (42477, 30.000), `polish_bankruptcy_2` (42984, 10.173),
+  `polish_bankruptcy_3` (42985, 10.503), `polish_bankruptcy_4` (42986, 9.792).
+- **Valutazione** (finanziari, in-domain, mai visti in training):
+  `polish_bankruptcy_1` (42880, 7.027), `polish_bankruptcy_5` (42987, 5.910),
+  `australian_credit` (40981, 690), `credit_g` (31, 1.000).
+
+Al caricamento, ogni dataset stampa una riga di **verifica** con nome, numero di
+righe/feature e distribuzione del target (presidio contro gli ID errati).
+
+### Esperimenti
+
+1. **Esp. 1 — generalizzazione in-domain** (`run_lora_exp5`): un LoRA allenato
+   sui 5 finanziari, valutato sui 4 di test finanziari.
+2. **Esp. 2 — ablation sulla capacità** (`run_lora_ablation`): r8/r16/QKVO, ora
+   eseguito sui nuovi dataset finanziari.
+3. **Esp. 3 — ablation sulla dimensione dei dati** (`run_lora_datasize_financial`):
+   usa `gmsc` (GiveMeSomeCredit, 45577, ~150.000 righe), test set **fisso** di
+   8.000 righe e training set crescenti (500 → 40.000) campionati stratificati;
+   produce tabella + grafico della curva AUC vs dimensione (base vs LoRA).
+   Sostituisce il vecchio esperimento a singolo `cardiovascular`.
+
+> **ID OpenML corretti** (diversi ID iniziali erano errati — verificare sempre):
+> - Polish bankruptcy: gli ID 40474–40478 erano dataset `thyroid` a **5 classi**;
+>   i corretti `polish-bankruptcy-Nyear` sono **42880/42984/42985/42986/42987**.
+> - `gmsc`: l'ID 44089 aveva solo 16.714 righe (insufficiente per training da
+>   40k); quello giusto è **45577** (`Give-Me-Some-Credit`, 150.000 righe).
+> - (storici, configurazione medica) `chronic_kidney` → 42972, `thyroid` → 1000.
+
+> ⚠️ **Versione di TabPFN per il LoRA.** L'iniezione degli adapter richiede
+> TabPFN **8.0.8** (attenzione con `q_projection`/`v_projection` separati). Le
+> versioni più vecchie (es. 7.1.1) fondono le proiezioni in un unico parametro
+> `_w_qkv` e l'iniezione fallisce. Su Colab è già 8.0.8; in locale assicurati di
+> installare `./TabPFN-main` (`pip install -e ./TabPFN-main`).
