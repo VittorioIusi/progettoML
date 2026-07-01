@@ -62,16 +62,18 @@ sotto il vincolo di \emph{non} riaddestrarne i pesi principali. Vengono
 esplorate due direzioni complementari. La prima, \emph{interna}, è un
 fine-tuning leggero basato su \emph{Low-Rank Adaptation} (LoRA): si descrive
 l'implementazione completa (iniezione e addestramento degli adapter) e si
-conducono tre esperimenti -- generalizzazione, ablation sulla capacità degli
-adapter e ablation sulla dimensione dei dati. La seconda, \emph{esterna},
+conducono tre esperimenti su dataset del dominio finanziario/creditizio --
+generalizzazione \emph{in-domain}, ablation sulla capacità degli adapter e
+ablation sulla dimensione dei dati. La seconda, \emph{esterna},
 lascia i pesi congelati e agisce sull'output del modello: ensembling
 (self-ensemble ed eterogeneo), calibrazione delle probabilità (Platt e
 isotonica) e ottimizzazione della soglia decisionale per l'F1 macro, valutate
 con ripetizioni multiple e split a tre vie anti-leakage. I risultati convergono verso
 una tesi unica: TabPFN-2.5 è vicino all'ottimo non solo nella capacità
 discriminativa, ma anche nella calibrazione e nella varianza delle stime. Né il
-LoRA (anche con $4\times$ capacità o $60\times$ dati), né l'ensembling, né la
-ricalibrazione producono miglioramenti robusti. L'unico intervento con effetto
+LoRA (anche in-domain, con $4\times$ capacità o dati fino a $80\times$), né
+l'ensembling, né la ricalibrazione producono miglioramenti robusti. L'unico
+intervento con effetto
 reale è l'ottimizzazione della soglia, che migliora l'F1 macro di $4$--$5$ punti
 sui dataset sbilanciati: un guadagno che non tocca né i pesi né le probabilità,
 ma soltanto la regola di decisione. Si tratta di un risultato negativo per le
@@ -134,52 +136,58 @@ totale.
 %==============================================================================
 
 \subsection{Dataset e preprocessing}
-Sono stati utilizzati dataset binari da OpenML (Tabella~\ref{tab:dataset}).
-Per il fine-tuning LoRA si impiegano cinque dataset \emph{medici}; per la
-valutazione della generalizzazione, quattro dataset mai usati in addestramento.
-La pipeline esterna (Sez.~\ref{sec:pipeline}) riprende i quattro dataset di
-valutazione e vi aggiunge due dataset binari di grandi dimensioni
-(\texttt{bank\_marketing}, \texttt{magic\_telescope}), per stabilizzare le
-stime delle metriche di calibrazione su insiemi di test ampi.
+Il fine-tuning LoRA impiega dataset del \textbf{dominio finanziario/creditizio}
+(Tabella~\ref{tab:dataset}): cinque dataset per l'addestramento e quattro per la
+valutazione, mai usati in training. La scelta di restare all'interno di un unico
+dominio consente una valutazione \emph{in-domain} (finanziario~$\to$~finanziario),
+adatta a rispondere alla domanda ``il LoRA riesce a specializzare TabPFN su uno
+specifico settore?''. L'ablation sulla dimensione dei dati (Sez.~\ref{sec:datasize})
+usa inoltre il dataset \texttt{gmsc} (\emph{Give-Me-Some-Credit}). La pipeline
+esterna (Sez.~\ref{sec:pipeline}) adotta un proprio benchmark di sei dataset,
+descritto nella Sez.~\ref{sec:pipeline-metodo}.
 
 \begin{table}[h]
 \centering
-\caption{Dataset utilizzati (OpenML). I dataset di valutazione non sono mai
-stati impiegati per l'addestramento degli adapter.}
+\caption{Dataset finanziari utilizzati per il LoRA (OpenML). I dataset di
+valutazione non sono mai stati impiegati per l'addestramento degli adapter.}
 \label{tab:dataset}
 \small
 \begin{tabular}{llrr}
 \toprule
 Ruolo & Dataset (OpenML ID) & Campioni & Feature \\
 \midrule
-Fine-tuning & \texttt{diabetes} (37)            & 768  & 8  \\
-Fine-tuning & \texttt{breast\_cancer} (1510)    & 569  & 30 \\
-Fine-tuning & \texttt{heart\_disease} (53)      & 270  & 13 \\
-Fine-tuning & \texttt{chronic\_kidney} (42972)  & 400  & 24 \\
-Fine-tuning & \texttt{hepatitis} (55)           & 155  & 19 \\
+Fine-tuning & \texttt{bank\_marketing} (1461)      & 45211 & 16 \\
+Fine-tuning & \texttt{default\_credit} (42477)     & 30000 & 23 \\
+Fine-tuning & \texttt{polish\_bankruptcy\_2} (42984) & 10173 & 64 \\
+Fine-tuning & \texttt{polish\_bankruptcy\_3} (42985) & 10503 & 64 \\
+Fine-tuning & \texttt{polish\_bankruptcy\_4} (42986) & 9792  & 64 \\
 \midrule
-Valutazione & \texttt{thyroid} (1000)           & 3772 & 28 \\
-Valutazione & \texttt{adult} (1590)             & 48842& 14 \\
-Valutazione & \texttt{credit\_g} (31)           & 1000 & 20 \\
-Valutazione & \texttt{blood\_transfusion} (1464)& 748  & 4  \\
+Valutazione & \texttt{polish\_bankruptcy\_1} (42880) & 7027  & 64 \\
+Valutazione & \texttt{polish\_bankruptcy\_5} (42987) & 5910  & 64 \\
+Valutazione & \texttt{australian\_credit} (40981)  & 690   & 14 \\
+Valutazione & \texttt{credit\_g} (31)              & 1000  & 20 \\
 \midrule
-Pipeline (agg.) & \texttt{bank\_marketing} (1461)  & 45211 & 16 \\
-Pipeline (agg.) & \texttt{magic\_telescope} (1120) & 19020 & 10 \\
+Ablation dati & \texttt{gmsc} (45577)              & 150000 & 10 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Correzione degli identificativi.} Durante l'implementazione due ID
-forniti nelle specifiche iniziali si sono rivelati errati e sono stati corretti
-dopo verifica diretta su OpenML:
+\paragraph{Verifica degli identificativi.} Alcuni ID OpenML forniti nelle
+specifiche iniziali si sono rivelati errati e sono stati corretti dopo verifica
+diretta (al caricamento ogni dataset stampa nome, dimensioni e distribuzione del
+target, come controllo):
 \begin{itemize}[nosep]
-  \item \texttt{chronic\_kidney}: l'ID 40922 corrisponde in realtà al dataset
-  \texttt{Run\_or\_walk\_information} (attività fisica, non pertinente); è stato
-  sostituito con \textbf{42972} (\texttt{chronic-kidney-disease});
-  \item \texttt{thyroid}: l'ID 40082 corrisponde a un dataset di chimica con 347
-  classi (\texttt{QSAR-DATASET-\dots}); è stato sostituito con \textbf{1000}
-  (\texttt{hypothyroid}), binario.
+  \item i dataset \texttt{polish\_bankruptcy\_1--5}: gli ID 40474--40478 indicati
+  corrispondono in realtà a dataset \texttt{thyroid} a \emph{cinque} classi (non
+  binari); gli ID corretti dei \texttt{polish-bankruptcy-Nyear} sono
+  \textbf{42880}, \textbf{42984}, \textbf{42985}, \textbf{42986}, \textbf{42987};
+  \item \texttt{gmsc}: l'ID 44089 conta solo $16\,714$ righe (insufficienti per un
+  training fino a $40\,000$); l'ID corretto è \textbf{45577}
+  (\texttt{Give-Me-Some-Credit}, $150\,000$ righe).
 \end{itemize}
+Si noti che i dataset \texttt{polish\_bankruptcy} sono fortemente sbilanciati
+(classe positiva $4$--$7\%$), il che rende particolarmente informative l'F1 macro
+e l'ottimizzazione della soglia.
 
 \paragraph{Pipeline di caricamento.} È stato implementato un modulo
 (\texttt{utils/data\_loader.py}) che, per ciascun dataset: (1)~scarica i dati da
@@ -304,53 +312,54 @@ Gli esperimenti di questa sezione sono stati eseguiti su GPU (Google Colab,
 NVIDIA T4). Baseline e modello LoRA condividono lo stesso numero di estimatori in
 inferenza per garantire un confronto equo.
 
-\subsection{Esperimento 1: generalizzazione (training multi-dataset)}
+\subsection{Esperimento 1: generalizzazione in-domain}
 \label{sec:exp5}
 Un \emph{unico} adapter LoRA ($r=8$, $\alpha=16$, schema QV; $294{,}912$
 parametri allenabili pari al $2{,}68\%$ del totale) è stato addestrato
-congiuntamente sui cinque dataset medici e poi valutato sui quattro dataset di
-test mai visti, per misurare la generalizzazione dell'adattamento. Durante
-l'addestramento la media dell'AUC di validazione è salita da $0{,}920$ a
-$0{,}930$, indicando che gli adapter \emph{apprendono} qualcosa di specifico al
-dominio medico. I risultati sui dataset di test sono riportati in
-Tabella~\ref{tab:exp5}.
+congiuntamente sui cinque dataset finanziari di fine-tuning e poi valutato sui
+quattro dataset finanziari di test mai visti, per misurare la generalizzazione
+\emph{in-domain} dell'adattamento. La migliore AUC media di validazione
+($0{,}911$) è stata raggiunta già alla seconda epoca, per poi decrescere: un
+primo segnale che l'addestramento allontana l'adapter dal buon punto di partenza.
+I risultati sui dataset di test sono riportati in Tabella~\ref{tab:exp5}.
 
 \begin{table}[h]
 \centering
 \caption{Esperimento 1 -- TabPFN base vs.\ TabPFN+LoRA sui dataset di
-valutazione. In \textbf{grassetto} il valore migliore per metrica e dataset.
-Frecce: $\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
+valutazione in-domain. In \textbf{grassetto} il valore migliore per metrica e
+dataset. Frecce: $\uparrow$ meglio se alto, $\downarrow$ meglio se basso.}
 \label{tab:exp5}
 \small
 \begin{tabular}{llcccc}
 \toprule
 Dataset & Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
 \midrule
-\multirow{2}{*}{\texttt{adult}}
- & base & \textbf{0.9220} & 0.8056 & \textbf{0.0920} & 0.0116 \\
- & LoRA & 0.9219 & \textbf{0.8060} & 0.0921 & \textbf{0.0107} \\
-\addlinespace
-\multirow{2}{*}{\texttt{blood\_transfusion}}
- & base & \textbf{0.7908} & \textbf{0.6643} & \textbf{0.1419} & 0.0948 \\
- & LoRA & 0.7906 & \textbf{0.6643} & \textbf{0.1419} & \textbf{0.0909} \\
+\multirow{2}{*}{\texttt{australian\_credit}}
+ & base & 0.9361 & \textbf{0.8261} & \textbf{0.1080} & \textbf{0.0686} \\
+ & LoRA & \textbf{0.9373} & 0.8188 & \textbf{0.1080} & 0.0709 \\
 \addlinespace
 \multirow{2}{*}{\texttt{credit\_g}}
- & base & 0.7750 & \textbf{0.6796} & 0.1677 & \textbf{0.0399} \\
- & LoRA & \textbf{0.7759} & \textbf{0.6796} & \textbf{0.1676} & 0.0454 \\
+ & base & 0.7750 & \textbf{0.6796} & 0.1677 & 0.0399 \\
+ & LoRA & \textbf{0.7758} & \textbf{0.6796} & \textbf{0.1675} & \textbf{0.0372} \\
 \addlinespace
-\multirow{2}{*}{\texttt{thyroid}}
- & base & \textbf{1.0000} & \textbf{0.9953} & \textbf{0.0014} & \textbf{0.0038} \\
- & LoRA & \textbf{1.0000} & \textbf{0.9953} & 0.0016 & 0.0041 \\
+\multirow{2}{*}{\texttt{polish\_bankruptcy\_1}}
+ & base & \textbf{0.9932} & \textbf{0.9055} & \textbf{0.0114} & 0.0193 \\
+ & LoRA & 0.9930 & \textbf{0.9055} & 0.0115 & \textbf{0.0191} \\
+\addlinespace
+\multirow{2}{*}{\texttt{polish\_bankruptcy\_5}}
+ & base & \textbf{0.9739} & 0.8518 & \textbf{0.0249} & \textbf{0.0161} \\
+ & LoRA & 0.9734 & \textbf{0.8547} & 0.0250 & 0.0166 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Le differenze sono tutte dell'ordine della terza--quarta cifra decimale, ovvero
-entro il rumore statistico. Il LoRA \emph{non} migliora né peggiora in modo
-significativo la discriminazione; si osserva un debole e non robusto vantaggio
-sulla calibrazione (ECE migliore in 2 dataset su 4). Da notare che il dataset
-medico tra i test (\texttt{thyroid}) è saturo (AUC $=1{,}0000$), quindi non offre
-margine di osservazione del transfer in-dominio.
+entro il rumore statistico: il LoRA \emph{non} migliora né peggiora in modo
+significativo alcuna metrica. Il risultato è più forte di quanto si otterrebbe
+in un setting cross-domain, perché qui addestramento e valutazione condividono
+lo stesso dominio: nemmeno \emph{in-domain} l'adattamento riesce a specializzare
+TabPFN. Si noti che i dataset \texttt{polish\_bankruptcy}, molto sbilanciati,
+hanno AUC molto alta ($\approx 0{,}97$--$0{,}99$) già per il modello base.
 
 \subsection{Esperimento 2: ablation sulla capacità}
 \label{sec:capacity}
@@ -361,104 +370,111 @@ configurazioni crescenti (Tabella~\ref{tab:capacity}).
 \begin{table}[h]
 \centering
 \caption{Esperimento 2 -- configurazioni LoRA a capacità crescente. La migliore
-AUC di validazione (sui dati medici) resta costante.}
+AUC di validazione resta sostanzialmente costante.}
 \label{tab:capacity}
 \small
 \begin{tabular}{lrrc}
 \toprule
 Config. & Target & Param.\ allenabili & Best val AUC \\
 \midrule
-\texttt{r8\_qv}    & q, v       & $294{,}912$\ ($2{,}7\%$)  & 0.9294 \\
-\texttt{r16\_qv}   & q, v       & $589{,}824$\ ($5{,}2\%$)  & 0.9295 \\
-\texttt{r16\_qkvo} & q, k, v, o & $1{,}179{,}648$\ ($9{,}9\%$) & 0.9295 \\
+\texttt{r8\_qv}    & q, v       & $294{,}912$\ ($2{,}7\%$)   & 0.9108 \\
+\texttt{r16\_qv}   & q, v       & $589{,}824$\ ($5{,}2\%$)   & 0.9105 \\
+\texttt{r16\_qkvo} & q, k, v, o & $1{,}179{,}648$\ ($9{,}9\%$) & 0.9100 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 Quadruplicando i parametri allenabili (dal $2{,}7\%$ al $9{,}9\%$) la migliore
-AUC di validazione resta sostanzialmente invariata ($0{,}9295$) e le metriche sui
-dataset di test sono indistinguibili; in un caso (F1 su \texttt{credit\_g}) la
-configurazione più capiente peggiora leggermente, suggerendo un principio di
-overfitting. Si conclude che \textbf{la capacità degli adapter non è il fattore
-limitante}.
+AUC di validazione resta sostanzialmente invariata ($\approx 0{,}910$, con anzi
+un lievissimo calo) e le metriche sui dataset di test sono indistinguibili. La
+configurazione più capiente (\texttt{r16\_qkvo}) peggiora l'F1 su
+\texttt{polish\_bankruptcy\_1} ($0{,}9055 \to 0{,}8921$), segno di un principio di
+\emph{overfitting}: più capacità non solo non aiuta, ma comincia a danneggiare.
+Si conclude che \textbf{la capacità degli adapter non è il fattore limitante}.
 
 \subsection{Esperimento 3: ablation sulla dimensione dei dati}
 \label{sec:datasize}
-La seconda ipotesi è che i dataset di fine-tuning, essendo piccoli
-($155$--$768$ righe), forniscano troppi pochi passi di gradiente. Per testarla,
-un adapter ($r=8$, QV) è stato addestrato e valutato \emph{in-distribution} su un
-dataset medico ampio, \texttt{Cardiovascular-Disease} (OpenML~45547), ridotto a
-$40\,000$ campioni per rispettare il limite di TabPFN ($\sim$$50\,000$):
-$32\,000$ righe di training (circa $60$ volte i dataset piccoli, suddivise in
-$\sim$$8$ chunk per epoca) e $8\,000$ di test.
+L'ultima ipotesi alternativa è che il LoRA non migliori per \emph{scarsità di
+dati} di addestramento. Per testarla in-domain si usa \texttt{gmsc}
+(\emph{Give-Me-Some-Credit}, OpenML~45577, $150\,000$ righe). Si ritaglia un
+\textbf{test set fisso} di $8\,000$ righe (mai modificato) e si allena l'adapter
+($r=8$, QV) su training set di dimensione crescente campionati stratificati dal
+resto: $500$, $2\,000$, $10\,000$ e $40\,000$ righe. Ogni configurazione rispetta
+il limite di TabPFN ($40\,000 + 8\,000 < 50\,000$). Il confronto base vs.\ LoRA
+sul medesimo test è riportato in Tabella~\ref{tab:datasize} e
+Figura~\ref{fig:datasize}.
 
 \begin{table}[h]
 \centering
-\caption{Esperimento 3 -- TabPFN base vs.\ LoRA su \texttt{cardiovascular}
-($32\,000$ righe di training, valutazione in-distribution).}
+\caption{Esperimento 3 -- TabPFN base vs.\ LoRA su \texttt{gmsc} al crescere del
+training set (test fisso di $8\,000$ righe).}
 \label{tab:datasize}
 \small
-\begin{tabular}{lcccc}
+\begin{tabular}{llcccc}
 \toprule
-Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
+Training & Modello & AUC-ROC$\uparrow$ & F1$\uparrow$ & Brier$\downarrow$ & ECE$\downarrow$ \\
 \midrule
-base & \textbf{0.7984} & \textbf{0.7291} & 0.1826 & 0.0275 \\
-LoRA & 0.7983 & 0.7290 & \textbf{0.1824} & \textbf{0.0229} \\
+\multirow{2}{*}{$500$}
+ & base & \textbf{0.8485} & \textbf{0.5362} & \textbf{0.0520} & 0.0119 \\
+ & LoRA & 0.8481 & 0.5330 & 0.0521 & \textbf{0.0116} \\
+\addlinespace
+\multirow{2}{*}{$2\,000$}
+ & base & \textbf{0.8565} & \textbf{0.5623} & \textbf{0.0505} & \textbf{0.0099} \\
+ & LoRA & 0.8553 & 0.5609 & 0.0506 & 0.0100 \\
+\addlinespace
+\multirow{2}{*}{$10\,000$}
+ & base & \textbf{0.8658} & 0.5786 & \textbf{0.0495} & \textbf{0.0090} \\
+ & LoRA & 0.8657 & \textbf{0.5788} & \textbf{0.0495} & 0.0091 \\
+\addlinespace
+\multirow{2}{*}{$40\,000$}
+ & base & \textbf{0.8690} & \textbf{0.6268} & \textbf{0.0491} & \textbf{0.0074} \\
+ & LoRA & 0.8674 & 0.6156 & 0.0494 & 0.0163 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Nonostante $60$ volte più dati, il LoRA resta equivalente al baseline sulla
-discriminazione (Tabella~\ref{tab:datasize}); l'unico miglioramento netto è di
-nuovo sulla calibrazione (ECE $0{,}0229$ vs.\ $0{,}0275$). \textbf{Anche
-l'ipotesi della scarsità di dati è quindi rigettata.}
-
-Particolarmente istruttiva è la dinamica dell'addestramento
-(Figura~\ref{fig:valauc}): la AUC di validazione raggiunge il massimo
-($0{,}8045$) già all'epoca~5 e poi \emph{decresce} monotonicamente
-($0{,}7789$ all'epoca~30), mentre la loss di training cresce. In altre parole, il
-modello parte $\approx$ base (per via di $B=0$) e ogni ulteriore addestramento lo
-\emph{allontana} dalla soluzione ottimale, peggiorandolo; solo l'early stopping
-preserva le prestazioni. Si noti infine che \texttt{cardiovascular} non è saturo
-(AUC $\approx 0{,}80$): esisteva margine di miglioramento, eppure il LoRA non lo
-ha colto.
+Il LoRA \emph{non} supera mai il baseline, a nessuna dimensione: le due curve di
+AUC restano sovrapposte (Figura~\ref{fig:datasize}). Il modello base
+\emph{migliora} con più dati (da $0{,}849$ a $0{,}869$), e il LoRA lo insegue
+senza mai staccarlo. Alla dimensione massima ($40\,000$, circa $80$ volte la più
+piccola) il LoRA anzi peggiora leggermente AUC, F1 ed ECE, con una dinamica di
+training instabile (la AUC di validazione, massima alla quinta epoca, poi crolla
+fino a $\approx 0{,}63$): solo l'early stopping ne preserva le prestazioni.
+\textbf{Anche l'ipotesi della scarsità di dati è quindi rigettata}: più dati
+giovano al modello, non all'adattamento.
 
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
     width=0.78\textwidth, height=6cm,
-    xlabel={Epoca di addestramento},
-    ylabel={AUC di validazione},
-    xmin=3, xmax=32, ymin=0.775, ymax=0.808,
-    xtick={5,10,15,20,25,30},
-    ytick={0.78,0.785,0.79,0.795,0.80,0.805},
+    xlabel={Dimensione del training set (scala log)},
+    ylabel={AUC-ROC sul test fisso},
+    xmode=log, log basis x=10,
+    xmin=400, xmax=50000, ymin=0.845, ymax=0.872,
+    xtick={500,2000,10000,40000},
+    xticklabels={500,2000,10000,40000},
+    ytick={0.85,0.855,0.86,0.865,0.87},
     yticklabel style={/pgf/number format/fixed, /pgf/number format/precision=3},
     grid=major, grid style={gray!25},
     tick label style={font=\footnotesize},
     label style={font=\small},
+    legend pos=south east, legend cell align=left,
     every axis plot/.append style={very thick},
 ]
-% Andamento della AUC di validazione (cardiovascular, LoRA r=8 QV)
-\addplot[color=blue, mark=*, mark size=2pt] coordinates {
-    (5,0.8045) (15,0.8011) (20,0.7966) (25,0.7882) (30,0.7789)
+\addplot[color=gray, mark=o, mark size=2.5pt] coordinates {
+    (500,0.8485) (2000,0.8565) (10000,0.8658) (40000,0.8690)
 };
-% Evidenzia il massimo (early stopping) all'epoca 5
-\addplot[only marks, mark=o, mark size=5pt, red, very thick]
-    coordinates {(5,0.8045)};
-\node[anchor=south west, font=\footnotesize, red] at (axis cs:5,0.8045)
-    {max (early stop)};
-% Livello del baseline TabPFN per riferimento
-\addplot[dashed, gray, thick] coordinates {(3,0.7984) (32,0.7984)};
-\node[anchor=south east, font=\footnotesize, gray] at (axis cs:32,0.7984)
-    {base 0.7984};
+\addplot[color=blue, mark=square*, mark size=2.5pt] coordinates {
+    (500,0.8481) (2000,0.8553) (10000,0.8657) (40000,0.8674)
+};
+\legend{TabPFN base, TabPFN + LoRA}
 \end{axis}
 \end{tikzpicture}
-\caption{Dinamica dell'early stopping nell'Esperimento~3 (\texttt{cardiovascular},
-adapter $r=8$ QV). La AUC di validazione è massima all'epoca~5 e poi
-\emph{decresce} monotonicamente: l'addestramento prolungato allontana il modello
-dalla soluzione ottimale. La linea tratteggiata è il livello del baseline TabPFN.}
-\label{fig:valauc}
+\caption{Esperimento~3 -- AUC-ROC sul test fisso di \texttt{gmsc} al crescere del
+training set. Le due curve sono praticamente sovrapposte: il LoRA segue il
+baseline senza mai superarlo, a ogni quantità di dati.}
+\label{fig:datasize}
 \end{figure}
 
 \subsection{Discussione del fine-tuning LoRA}
@@ -470,9 +486,12 @@ spiegazioni alternative più naturali sono state escluse sperimentalmente:
 \begin{itemize}[nosep]
   \item \textbf{non è un problema di capacità}: un aumento di $4\times$ dei
   parametri allenabili non produce alcun cambiamento (Sez.~\ref{sec:capacity});
-  \item \textbf{non è un problema di dati}: un aumento di $\sim$$60\times$ dei
-  dati di training non produce miglioramenti, e un addestramento prolungato
-  degrada il modello (Sez.~\ref{sec:datasize}).
+  \item \textbf{non è un problema di dati}: un aumento fino a $80\times$ dei dati
+  di training non produce miglioramenti, e un addestramento prolungato degrada il
+  modello (Sez.~\ref{sec:datasize});
+  \item \textbf{non è un problema di dominio}: la valutazione è \emph{in-domain}
+  (finanziario), quindi il mancato beneficio non è imputabile a uno shift di
+  dominio (Sez.~\ref{sec:exp5}).
 \end{itemize}
 
 \begin{table}[h]
@@ -484,9 +503,9 @@ spiegazioni alternative più naturali sono state escluse sperimentalmente:
 \toprule
 Ipotesi & Esperimento & Esito \\
 \midrule
-Generalizzazione fuori dominio & Exp.~1 (medici $\to$ test) & LoRA $\approx$ base, non distruttivo \\
-Capacità insufficiente & Exp.~2 (ablation $r$, target) & nessun cambiamento \\
-Dati insufficienti & Exp.~3 ($60\times$ dati) & nessun gain; over-training degrada \\
+Generalizzazione in-domain & Exp.~1 (finanziario $\to$ finanziario) & LoRA $\approx$ base \\
+Capacità insufficiente & Exp.~2 (ablation $r$, target) & nessun cambiamento; overfitting \\
+Dati insufficienti & Exp.~3 (fino a $80\times$ dati) & nessun gain; over-training degrada \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -495,13 +514,12 @@ La spiegazione residua, e più solida, è che \textbf{i pesi pre-addestrati di
 TabPFN-2.5 sono già vicini all'ottimo} per questa classe di problemi: il suo
 in-context learning estrae quasi tutto il segnale disponibile, e un adattamento a
 basso rango non può aggiungervi capacità discriminativa, potendo solo
-allontanarsi dal buon punto di partenza. Un aspetto positivo è che l'adattamento
-risulta \emph{non distruttivo}: pur essendo addestrato solo su dati medici, non
-degrada le prestazioni sui dataset di test non medici, evidenziando robustezza
-allo \emph{shift} di dominio. Inoltre, l'unico segnale ricorrente -- per quanto
-modesto -- è il miglioramento della \emph{calibrazione} (ECE), il che suggerisce
-che eventuali benefici vadano cercati nel post-processing piuttosto che
-nell'adattamento dei pesi: è esattamente la direzione esplorata nella
+allontanarsi dal buon punto di partenza. Il fatto che il risultato valga
+\emph{in-domain} lo rende particolarmente netto: non è un problema di
+trasferimento tra domini diversi, ma un vero soffitto del modello. L'unico
+segnale ricorrente -- per quanto modesto -- è sulla \emph{calibrazione} (ECE), il
+che suggerisce che eventuali benefici vadano cercati nel post-processing piuttosto
+che nell'adattamento dei pesi: è esattamente la direzione esplorata nella
 Sezione~\ref{sec:pipeline}.
 
 \paragraph{Note implementative rilevanti.} Durante lo sviluppo sono emersi alcuni
@@ -566,17 +584,17 @@ Ottimizzazione soglia (Esp.~5b)& $=$        & \checkmark   & $=$        & $=$   
 \subsection{Metodologia sperimentale}
 \label{sec:pipeline-metodo}
 
-\paragraph{Dataset.} Gli esperimenti riprendono i quattro dataset di
-valutazione del capitolo LoRA (\texttt{thyroid}, \texttt{adult},
-\texttt{credit\_g}, \texttt{blood\_transfusion}), così da consentire un
-confronto diretto, e vi aggiungono due dataset binari di grandi dimensioni --
-\texttt{bank\_marketing} (OpenML~1461, $45\,211$ righe) e
-\texttt{magic\_telescope} (OpenML~1120, $19\,020$ righe). La ragione è
-metodologica: le metriche di calibrazione (in particolare l'ECE, basato su 10
-bin) sono rumorose su insiemi di test piccoli; i due dataset \texttt{credit\_g}
-($1\,000$) e \texttt{blood\_transfusion} ($748$) sono troppo ridotti perché le
-conclusioni su calibrazione e soglia siano robuste se prese isolatamente, mentre
-i dataset grandi forniscono insiemi di test ampi e stime stabili.
+\paragraph{Dataset.} Gli esperimenti adottano un benchmark di sei dataset
+binari: quattro di dimensione medio-piccola (\texttt{thyroid},
+\texttt{blood\_transfusion}, \texttt{credit\_g}, \texttt{adult}) e due di grandi
+dimensioni -- \texttt{bank\_marketing} (OpenML~1461, $45\,211$ righe) e
+\texttt{magic\_telescope} (OpenML~1120, $19\,020$ righe). La ragione dei due
+dataset grandi è metodologica: le metriche di calibrazione (in particolare l'ECE,
+basato su 10 bin) sono rumorose su insiemi di test piccoli; i dataset
+\texttt{credit\_g} ($1\,000$) e \texttt{blood\_transfusion} ($748$) sono troppo
+ridotti perché le conclusioni su calibrazione e soglia siano robuste se prese
+isolatamente, mentre i dataset grandi forniscono insiemi di test ampi e stime
+stabili.
 
 \paragraph{Split a tre vie e assenza di leakage.} Per ciascun dataset si adotta
 una suddivisione stratificata in tre parti: \emph{train/context}
@@ -865,7 +883,7 @@ sullo stato dell'arte dei modelli tabulari pre-addestrati.
   \item \texttt{models/tabpfn\_lora.py} -- integrazione con TabPFN: costruzione
   del classificatore con adapter, loop di training, early stopping, esperimenti
   (\texttt{run\_lora\_exp5}, \texttt{run\_lora\_ablation},
-  \texttt{run\_lora\_datasize\_experiment}).
+  \texttt{run\_lora\_datasize\_financial}).
   \item \texttt{pipeline/external\_pipeline.py} -- pipeline esterna: helper puri
   (\texttt{average\_probas}, \texttt{fit\_calibrator}, \texttt{optimize\_threshold})
   ed esperimenti (\texttt{run\_ensemble\_experiment},
